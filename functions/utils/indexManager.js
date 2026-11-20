@@ -162,6 +162,19 @@ export async function removeFileFromIndex(context, fileId) {
         });
 
         console.log(`File ${fileId} remove operation recorded with ID: ${operationId}`);
+
+        // 立刻把这次删除合进索引再返回：只记操作是不够的，操作要靠 KV list
+        // 才能被下一次列表请求发现，而 KV list 是最终一致的——刚写下的操作键
+        // 可能要过几秒才出现在 list 结果里，这段时间里刷新列表，删掉的图片还在。
+        // 把刚记的操作直接传给合并（不依赖 list），响应前索引里已经没有它了，
+        // 刷新一次就消失。操作记录本身留在队列里当保险（见合并里的说明）。
+        const mergeResult = await mergeOperationsToIndex(context, {
+            extraOperations: [{ id: operationId, type: 'remove', timestamp: Date.now(), data: { fileId } }]
+        });
+        if (!mergeResult.success && !mergeResult.remainingOperations && !mergeResult.indexUnavailable) {
+            return { success: false, error: mergeResult.error || 'Failed to merge remove operation into index' };
+        }
+
         return { success: true, operationId };
     } catch (error) {
         console.error('Error recording remove file operation:', error);
@@ -182,6 +195,17 @@ export async function batchRemoveFilesFromIndex(context, fileIds) {
         });
 
         console.log(`Batch remove operation recorded with ID: ${operationId}, ${fileIds.length} files`);
+
+        // 立刻把这次删除合进索引再返回，原因同 removeFileFromIndex：
+        // 只记操作要靠 KV list 才能被下一次列表请求发现，而 KV list 是最终一致的，
+        // 刚写下的操作键可能要过几秒才出现，这段时间里刷新列表，删掉的图片还在。
+        const mergeResult = await mergeOperationsToIndex(context, {
+            extraOperations: [{ id: operationId, type: 'batch_remove', timestamp: Date.now(), data: { fileIds } }]
+        });
+        if (!mergeResult.success && !mergeResult.remainingOperations && !mergeResult.indexUnavailable) {
+            return { success: false, error: mergeResult.error || 'Failed to merge batch remove operation into index', totalProcessed: 0 };
+        }
+
         return {
             success: true,
             operationId,
@@ -304,7 +328,11 @@ export async function batchMoveFilesInIndex(context, moveOperations) {
  */
 export async function mergeOperationsToIndex(context, options = {}) {
     const { request } = context;
-    const { cleanupAfterMerge = true } = options;
+    // extraOperations：调用方直接带来的操作记录。刚写进 KV 的操作键，
+    // KV list 是最终一致的，可能要过几秒才出现在 list 结果里；只靠 list 发现，
+    // 删图后立刻刷新列表还会看到它。调用方（删图）把刚记的操作直接带来，
+    // 这次合并就应用它，不用等 list。
+    const { cleanupAfterMerge = true, extraOperations = [] } = options;
     
     try {
         console.log('Starting operations merge...');
@@ -315,7 +343,10 @@ export async function mergeOperationsToIndex(context, options = {}) {
             console.error('Failed to get current index for merge');
             return {
                 success: false,
-                error: 'Failed to get current index'
+                error: 'Failed to get current index',
+                // 索引还不存在或读不出来：对删除来说等于“索引里本来就没有它”，
+                // 调用方可以当成功处理（操作记录还留在队列里，索引建好后重放是幂等的）。
+                indexUnavailable: true
             };
         }
 
@@ -324,6 +355,16 @@ export async function mergeOperationsToIndex(context, options = {}) {
 
         const operations = operationsResult.operations;
         const isALLOperations = operationsResult.isAll;
+
+        // 把调用方带来的操作并进去（list 还没看到的也算数）；已经在列表里的不重复加。
+        const listedIds = new Set(operations.map(op => op.id));
+        const extraNotListedIds = [];
+        for (const op of extraOperations) {
+            if (op && op.id && !listedIds.has(op.id)) {
+                operations.push(op);
+                extraNotListedIds.push(op.id);
+            }
+        }
 
         if (operations.length === 0) {
             console.log('No pending operations to merge');
@@ -427,9 +468,15 @@ export async function mergeOperationsToIndex(context, options = {}) {
             console.log(`Index updated: ${addedCount} added, ${updatedCount} updated, ${removedCount} removed, ${movedCount} moved`);
         }
 
-        // 清理已处理的操作记录
+        // 清理已处理的操作记录。只清理 list 看到的那部分：调用方带来的、
+        // list 还没看到的操作记录留在队列里当保险——万一有并发的合并盖掉了
+        // 这次保存，下一次合并重放它还能补上（remove 是幂等的过滤，重放无害），
+        // 重放后才会被清理。
         if (cleanupAfterMerge && processedOperationIds.length > 0) {
-            await cleanupOperations(context, processedOperationIds);
+            const toCleanup = processedOperationIds.filter(id => !extraNotListedIds.includes(id));
+            if (toCleanup.length > 0) {
+                await cleanupOperations(context, toCleanup);
+            }
         }
 
         // 如果未处理完所有操作，调用 merge-operations API 递归处理
@@ -444,7 +491,10 @@ export async function mergeOperationsToIndex(context, options = {}) {
 
             return {
                 success: false,
-                error: 'There are remaining operations, will process them in subsequent calls.'
+                error: 'There are remaining operations, will process them in subsequent calls.',
+                // 本次的操作已经应用并保存了，只是队列里还有剩下的；
+                // 调用方（删图）可以把它当成功处理。
+                remainingOperations: true
             };
         }
 
@@ -758,7 +808,7 @@ export async function readIndex(context, options = {}) {
  * @param {Function} progressCallback - 进度回调函数
  */
 export async function rebuildIndex(context, progressCallback = null) {
-    const { env, waitUntil } = context;
+    const { env } = context;
     const db = getDatabase(env);
 
     try {
@@ -830,8 +880,12 @@ export async function rebuildIndex(context, progressCallback = null) {
         }
 
         // 清除旧的操作记录和多余索引
-        waitUntil(deleteAllOperations(context));
-        waitUntil(clearChunkedIndex(context, true));
+        // 注意：必须用 context.waitUntil(...) 调用，不能先解构出来——
+        // 有些调用方的 waitUntil 是靠 this 取后台任务列表的方法，解构后 this 丢了会报错。
+        if (typeof context.waitUntil === 'function') {
+            context.waitUntil(deleteAllOperations(context));
+            context.waitUntil(clearChunkedIndex(context, true));
+        }
 
 
         console.log(`Index rebuild completed. Processed ${processedCount} files, indexed ${newIndex.totalCount} files.`);
@@ -1667,7 +1721,6 @@ export async function deleteAllOperations(context) {
  * @param {Object} context - 上下文对象
  */
 async function getIndex(context) {
-    const { waitUntil } = context;
     try {
         // 首先尝试加载分块索引
         const index = await loadChunkedIndex(context);
@@ -1675,11 +1728,13 @@ async function getIndex(context) {
             return index;
         } else {
             // 如果加载失败，触发重建索引
-            waitUntil(rebuildIndex(context));
+            // 注意：必须用 context.waitUntil(...) 调用，不能先解构出来——
+            // 有些调用方的 waitUntil 是靠 this 取后台任务列表的方法，解构后 this 丢了会报错。
+            if (typeof context.waitUntil === 'function') context.waitUntil(rebuildIndex(context));
         }
     } catch (error) {
         console.warn('Error reading index, creating new one:', error);
-        waitUntil(rebuildIndex(context));
+        if (typeof context.waitUntil === 'function') context.waitUntil(rebuildIndex(context));
     }
     
     // 返回空的索引结构

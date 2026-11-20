@@ -162,6 +162,24 @@ describe('read and list files', () => {
         assert.deepEqual(result.files, []);
     });
 
+    it('applies caller-supplied operations that the operation list has not seen yet', async () => {
+        // 回归：删图后立刻刷新还看得到。只记操作不够，操作要靠 KV list 才能被
+        // 下一次列表请求发现，而 KV list 是最终一致的，刚写下的操作键可能要过
+        // 几秒才出现在 list 结果里。调用方把刚记的操作直接带来，合并立刻应用。
+        const index = await loadFunction('functions/utils/indexManager.js', mocks);
+        const files = [{ id: 'victim.png', metadata: { FileName: 'victim.png', FileType: 'image/png', TimeStamp: 1 } }];
+        await db.put('manage@index@meta', JSON.stringify({ chunkCount: 1, totalCount: 1, lastUpdated: 1 }));
+        await db.put('manage@index_0', JSON.stringify(files));
+        const ctx = context('https://test/api/manage/list');
+        const result = await index.mergeOperationsToIndex(ctx, {
+            extraOperations: [{ id: '1700000000000_aaaaaaa', type: 'remove', timestamp: 1700000000000, data: { fileId: 'victim.png' } }]
+        });
+        assert.equal(result.success, true);
+        const read = await index.readIndex(ctx, { count: -1 });
+        assert.equal(read.success, true);
+        assert.deepEqual(read.files, []);
+    });
+
     it('preserves GET/HEAD/Range response behavior and Content-Type parameters without historical inference', async () => {
         const route = await loadFunction('functions/file/[[path]].js', {
             ...mocks, ...fileTools, ...imageTransform,
