@@ -51,6 +51,10 @@ export async function onRequest(context) {  // Contents of context object
         return new Response('Error: Decode Image ID Failed', { status: 400 });
     }
 
+    // 元数据读取与安全配置读取互不依赖，并行发起，省一次 KV 往返
+    const db = getDatabase(env);
+    const imgRecordPromise = db.getWithMetadata(fileId);
+
     // 读取安全配置，解析必要参数
     const securityConfig = await fetchSecurityConfig(env);
     context.securityConfig = securityConfig;
@@ -74,9 +78,8 @@ export async function onRequest(context) {  // Contents of context object
         return await returnBlockImg(url);
     }
 
-    // 从数据库中获取图片记录
-    const db = getDatabase(env);
-    const imgRecord = await db.getWithMetadata(fileId);
+    // 从数据库中获取图片记录（入口处已与安全配置并行发起）
+    const imgRecord = await imgRecordPromise;
     if (!imgRecord) {
         return new Response('Error: Image Not Found', { status: 404 });
     }
@@ -399,35 +402,41 @@ async function handleTelegramChunkedFile(context, imgRecord, encodedFileName, fi
 
     try {
         // 创建支持Range请求的流
+        // 先算出与请求范围重叠的分片，并让下一个分片的拉取与当前分片的发送重叠：
+        // 原来是串行等每个分片（TG 每次拉取几百毫秒），分片一多整图就慢好几秒
+        const neededChunks = [];
+        let chunkPos = 0;
+        for (let i = 0; i < chunks.length; i++) {
+            const size = chunks[i].size || 0;
+            if (chunkPos + size > rangeStart && chunkPos <= rangeEnd) {
+                neededChunks.push({ index: i, start: chunkPos });
+            }
+            chunkPos += size;
+        }
+
         const stream = new ReadableStream({
             async start(controller) {
                 try {
-                    let currentPosition = 0;
+                    let nextFetch = neededChunks.length > 0
+                        ? fetchTelegramChunkWithRetry(TgBotToken, chunks[neededChunks[0].index], TgProxyUrl, 3)
+                        : null;
 
-                    for (let i = 0; i < chunks.length; i++) {
-                        const chunk = chunks[i];
+                    for (let n = 0; n < neededChunks.length; n++) {
+                        const { index, start } = neededChunks[n];
+                        const chunk = chunks[index];
                         const chunkSize = chunk.size || 0;
 
-                        // 如果当前分片完全在请求范围之前，跳过
-                        if (currentPosition + chunkSize <= rangeStart) {
-                            currentPosition += chunkSize;
-                            continue;
+                        const chunkData = await nextFetch;
+                        if (n + 1 < neededChunks.length) {
+                            nextFetch = fetchTelegramChunkWithRetry(TgBotToken, chunks[neededChunks[n + 1].index], TgProxyUrl, 3);
                         }
-
-                        // 如果当前分片完全在请求范围之后，结束
-                        if (currentPosition > rangeEnd) {
-                            break;
-                        }
-
-                        // 获取分片数据（支持代理域名）
-                        const chunkData = await fetchTelegramChunkWithRetry(TgBotToken, chunk, TgProxyUrl, 3);
                         if (!chunkData) {
                             throw new Error(`Failed to fetch chunk ${chunk.index} after retries`);
                         }
 
                         // 计算在当前分片中的起始和结束位置
-                        const chunkStart = Math.max(0, rangeStart - currentPosition);
-                        const chunkEnd = Math.min(chunkSize, rangeEnd - currentPosition + 1);
+                        const chunkStart = Math.max(0, rangeStart - start);
+                        const chunkEnd = Math.min(chunkSize, rangeEnd - start + 1);
 
                         // 如果需要部分分片数据
                         if (chunkStart > 0 || chunkEnd < chunkSize) {
@@ -436,8 +445,6 @@ async function handleTelegramChunkedFile(context, imgRecord, encodedFileName, fi
                         } else {
                             controller.enqueue(chunkData);
                         }
-
-                        currentPosition += chunkSize;
                     }
 
                     controller.close();
@@ -593,35 +600,41 @@ async function handleDiscordChunkedFile(context, imgRecord, encodedFileName, fil
 
     try {
         // 创建支持Range请求的流
+        // 先算出与请求范围重叠的分片，并让下一个分片的拉取与当前分片的发送重叠：
+        // 原来是串行等每个分片（Discord 每次要先调 API 取附件 URL 再拉取），分片一多整图就慢好几秒
+        const neededChunks = [];
+        let chunkPos = 0;
+        for (let i = 0; i < chunks.length; i++) {
+            const size = chunks[i].size || 0;
+            if (chunkPos + size > rangeStart && chunkPos <= rangeEnd) {
+                neededChunks.push({ index: i, start: chunkPos });
+            }
+            chunkPos += size;
+        }
+
         const stream = new ReadableStream({
             async start(controller) {
                 try {
-                    let currentPosition = 0;
+                    let nextFetch = neededChunks.length > 0
+                        ? fetchDiscordChunkWithRetry(botToken, channelId, chunks[neededChunks[0].index], proxyUrl, 3)
+                        : null;
 
-                    for (let i = 0; i < chunks.length; i++) {
-                        const chunk = chunks[i];
+                    for (let n = 0; n < neededChunks.length; n++) {
+                        const { index, start } = neededChunks[n];
+                        const chunk = chunks[index];
                         const chunkSize = chunk.size || 0;
 
-                        // 如果当前分片完全在请求范围之前，跳过
-                        if (currentPosition + chunkSize <= rangeStart) {
-                            currentPosition += chunkSize;
-                            continue;
+                        const chunkData = await nextFetch;
+                        if (n + 1 < neededChunks.length) {
+                            nextFetch = fetchDiscordChunkWithRetry(botToken, channelId, chunks[neededChunks[n + 1].index], proxyUrl, 3);
                         }
-
-                        // 如果当前分片完全在请求范围之后，结束
-                        if (currentPosition > rangeEnd) {
-                            break;
-                        }
-
-                        // 获取分片数据（每次通过 API 获取新的附件 URL）
-                        const chunkData = await fetchDiscordChunkWithRetry(botToken, channelId, chunk, proxyUrl, 3);
                         if (!chunkData) {
                             throw new Error(`Failed to fetch Discord chunk ${chunk.index} after retries`);
                         }
 
                         // 计算在当前分片中的起始和结束位置
-                        const chunkStart = Math.max(0, rangeStart - currentPosition);
-                        const chunkEnd = Math.min(chunkSize, rangeEnd - currentPosition + 1);
+                        const chunkStart = Math.max(0, rangeStart - start);
+                        const chunkEnd = Math.min(chunkSize, rangeEnd - start + 1);
 
                         // 如果需要部分分片数据
                         if (chunkStart > 0 || chunkEnd < chunkSize) {
@@ -630,8 +643,6 @@ async function handleDiscordChunkedFile(context, imgRecord, encodedFileName, fil
                         } else {
                             controller.enqueue(chunkData);
                         }
-
-                        currentPosition += chunkSize;
                     }
 
                     controller.close();

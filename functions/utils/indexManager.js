@@ -330,7 +330,9 @@ export async function mergeOperationsToIndex(context, options = {}) {
             return {
                 success: true,
                 processedOperations: 0,
-                message: 'No pending operations'
+                message: 'No pending operations',
+                // 索引已经读进内存了，调用方直接复用，不用再全量读一遍
+                index: currentIndex
             };
         }
 
@@ -453,7 +455,9 @@ export async function mergeOperationsToIndex(context, options = {}) {
             updatedCount,
             removedCount,
             movedCount,
-            totalFiles: workingIndex.totalCount
+            totalFiles: workingIndex.totalCount,
+            // 合并后的索引直接带回给调用方复用
+            index: workingIndex
         };
 
         console.log('Operations merge completed:', result);
@@ -517,15 +521,16 @@ export async function readIndex(context, options = {}) {
         // 处理目录满足无头有尾的格式，根目录为空
         const dirPrefix = directory === '' || directory.endsWith('/') ? directory : directory + '/';
 
-        // 处理挂起的操作
+        // 处理挂起的操作；合并时已经把完整索引读进内存了，直接复用，
+        // 不用再全量读第二遍（原来每次列表请求都要读两遍整个索引）
         const mergeResult = await mergeOperationsToIndex(context);
         if (!mergeResult.success) {
             throw new Error('Failed to merge operations: ' + mergeResult.error);
         }
 
-        // 获取当前索引
-        const index = await getIndex(context);
-        if (!index.success) {
+        // 获取当前索引（复用合并结果里的索引）
+        const index = mergeResult.index;
+        if (!index || !index.success) {
             throw new Error('Failed to get index');
         }
 
@@ -2150,11 +2155,11 @@ export async function getIndexStorageStats(context) {
  * @returns {Object} 树形结构 { name, path, children }
  */
 export async function getDirectoryTree(context) {
-    // 1. 合并挂起操作
-    await mergeOperationsToIndex(context);
+    // 1. 合并挂起操作，复用合并时已读进内存的索引
+    const mergeResult = await mergeOperationsToIndex(context);
 
     // 2. 获取索引
-    const index = await getIndex(context);
+    const index = mergeResult.index || await getIndex(context);
 
     // 3. 提取所有目录路径
     const directorySet = new Set();

@@ -25,9 +25,11 @@ export async function onRequest(context) {  // Contents of context object
     const url = new URL(request.url);
     context.url = url;
 
-    // 读取各项配置，存入 context
-    const securityConfig = await fetchSecurityConfig(env);
-    const uploadConfig = await fetchUploadConfig(env, context);
+    // 读取各项配置，存入 context；两处配置读取互不依赖，并行发起
+    const [securityConfig, uploadConfig] = await Promise.all([
+        fetchSecurityConfig(env),
+        fetchUploadConfig(env, context),
+    ]);
 
     context.securityConfig = securityConfig;
     context.uploadConfig = uploadConfig;

@@ -1,5 +1,5 @@
 import { fetchSecurityConfig } from "../utils/sysConfig";
-import { purgeCFCache, purgeRandomFileListCache, purgePublicFileListCache } from "../utils/purgeCache";
+import { purgeRandomFileListCache, purgePublicFileListCache } from "../utils/purgeCache";
 import { addFileToIndex } from "../utils/indexManager.js";
 import { getDatabase } from '../utils/databaseAdapter.js';
 import { resolveFileExt } from '../utils/mimeTypes.js';
@@ -358,16 +358,13 @@ export async function moderateContent(env, url) {
 }
 
 // 清除CDN缓存
+// 注意：这里只清随机/公开列表的本地缓存，不再调 Cloudflare API 清文件 URL。
+// 新上传的文件 ID 都是新生成的，从未被边缘缓存过，清它纯属浪费一次 API 往返
+// （还得用 Global API Key）；删除/改名/移动等真正会产生旧缓存的入口，
+// 各自直接调 purgeCFCache 清指定的旧 URL，不受这里影响。
 export async function purgeCDNCache(env, cdnUrl, url, normalizedFolder) {
     if (env.dev_mode === 'true') {
         return;
-    }
-
-    // 清除CDN缓存
-    try {
-        await purgeCFCache(env, cdnUrl);
-    } catch (error) {
-        console.error('Failed to clear CDN cache:', error);
     }
 
     // 清除 api/randomFileList 等API缓存

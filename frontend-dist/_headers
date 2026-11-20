@@ -1,0 +1,17 @@
+# 带哈希的文件名永不变化：缓存一年，浏览器不再重新下载
+/js/*
+  Cache-Control: public, max-age=31536000, immutable
+/css/*
+  Cache-Control: public, max-age=31536000, immutable
+/fonts/*
+  Cache-Control: public, max-age=31536000, immutable
+/entry/*
+  Cache-Control: public, max-age=31536000, immutable
+/img/*
+  Cache-Control: public, max-age=31536000, immutable
+/static/*
+  Cache-Control: public, max-age=31536000, immutable
+
+# 入口 HTML 每次都重新确认，保证拿到最新版本
+/*
+  Cache-Control: public, max-age=0, must-revalidate
