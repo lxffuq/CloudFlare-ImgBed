@@ -1,4 +1,7 @@
-# 带哈希的文件名永不变化：缓存一年，浏览器不再重新下载
+# 带哈希的文件名永不变化：缓存一年，浏览器不再重复下载
+# 注意：不要在这里加 /* 通配规则——Cloudflare 会把所有匹配规则的
+# Cache-Control 合并到一起，通配规则会把一年缓存冲掉；首页等 HTML
+# 本来就是 Pages 默认的 max-age=0，不用单独写。
 /js/*
   Cache-Control: public, max-age=31536000, immutable
 /css/*
@@ -11,7 +14,3 @@
   Cache-Control: public, max-age=31536000, immutable
 /static/*
   Cache-Control: public, max-age=31536000, immutable
-
-# 入口 HTML 每次都重新确认，保证拿到最新版本
-/*
-  Cache-Control: public, max-age=0, must-revalidate
