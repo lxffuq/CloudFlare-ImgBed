@@ -37,7 +37,7 @@ export async function onRequest(context) {
         const results = await mapConcurrent(fileIds, DELETE_CONCURRENCY, async (fileId) => {
             try {
                 const cdnUrl = `${url.origin}/file/${fileId.split('/').map(encodeURIComponent).join('/')}`;
-                const result = await deleteFile(context.env, fileId, cdnUrl, url);
+                const result = await deleteFile(context.env, fileId, cdnUrl, url, context.waitUntil);
                 const success = !!(result && result.deleted);
                 return { fileId, success, existed: !!(result && result.existed), error: success ? '' : 'Delete file failed' };
             } catch (err) {
@@ -50,7 +50,9 @@ export async function onRequest(context) {
         const missing = results.filter((item) => item.success && !item.existed).map((item) => item.fileId);
         const failed = results.filter((item) => !item.success).map(({ fileId, error }) => ({ fileId, error }));
         if (deleted.length > 0) {
-            context.waitUntil(batchRemoveFilesFromIndex(context, deleted));
+            // 整批只合并一次，响应前完成，刷新后不再出现
+            const indexResult = await batchRemoveFilesFromIndex(context, deleted);
+            if (!indexResult.success) console.warn('Index sync failed after batch delete:', indexResult.error);
         }
         return jsonResponse({ success: failed.length === 0, deleted, missing, failed, details: results });
     } catch (error) {

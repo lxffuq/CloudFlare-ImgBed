@@ -40,15 +40,22 @@ describe('delete files', () => {
         const response = await single.onRequest(ctx);
         assert.equal(response.status, 200);
         assert.deepEqual(await response.json(), { success: true, fileId: id, existed: true });
+        // R2 是本地存储，同步删除；记录与索引在响应前已同步，不等后台任务
         assert.equal(fixture.objects.has(id), false);
         assert.equal(await fixture.db.getWithMetadata(id), null);
         assert.equal(fixture.db.records.has(marker), false);
+        const indexBefore = await fixture.mocks.readIndex(ctx, { count: -1, includeSubdirFiles: true });
+        assert.equal(indexBefore.success, true);
+        assert.deepEqual(indexBefore.files, []);
+        // 随机/公开列表缓存同步清掉；CDN 清缓存放后台（单测里 mock 是同步的，
+        // 所以响应时已记录；线上是网络调用，不阻塞响应）
+        assert.deepEqual(fixture.purges, [
+            ['random', 'https://test', '相册'], ['public', 'https://test', '相册'],
+            ['file', `https://test/file/${id}`],
+        ]);
         const index = await fixture.readFiles(ctx);
         assert.equal(index.success, true);
         assert.deepEqual(index.files, []);
-        assert.deepEqual(fixture.purges, [
-            ['file', `https://test/file/${id}`], ['random', 'https://test', '相册'], ['public', 'https://test', '相册'],
-        ]);
     });
 
     it('keeps repeated deletion idempotent when the record no longer exists', async () => {

@@ -104,7 +104,7 @@ export async function onRequest(context) {
                         failedFiles.push(fileId);
                         continue;
                     }
-                    const result = await deleteFile(env, fileId, cdnUrl, url);
+                    const result = await deleteFile(env, fileId, cdnUrl, url, waitUntil);
                     const success = !!(result && result.deleted);
                     details.push({ fileId, success, existed: !!result?.existed, error: success ? '' : 'Delete file failed' });
                     if (success) {
@@ -125,9 +125,10 @@ export async function onRequest(context) {
                 }
             }
 
-            // 批量从索引中删除文件
+            // 批量从索引中删除文件：整批只合并一次，响应前完成，刷新后不再出现
             if (deletedFiles.length > 0) {
-                waitUntil(batchRemoveFilesFromIndex(context, deletedFiles));
+                const indexResult = await batchRemoveFilesFromIndex(context, deletedFiles);
+                if (!indexResult.success) console.warn('Index sync failed after folder delete:', indexResult.error);
             }
 
             return new Response(JSON.stringify({
@@ -161,12 +162,14 @@ export async function onRequest(context) {
         // 系统配置键（manage@ 开头等）禁止删除：禁 manage@ 前缀、空段、..。
         assertDeletableFileId(fileId);
 
-        const result = await deleteFile(env, fileId, cdnUrl, url);
+        const result = await deleteFile(env, fileId, cdnUrl, url, waitUntil);
         if (!result || !result.deleted) {
             throw new Error('Delete file failed');
         } else {
-            // 记录不存在时也可能有残留索引，因此仍需清理。
-            waitUntil(removeFileFromIndex(context, fileId));
+            // 记录不存在时也可能有残留索引，因此仍需清理；响应前同步合并，
+            // 刷新后已删文件不会重新出现。
+            const indexResult = await removeFileFromIndex(context, fileId);
+            if (!indexResult.success) console.warn('Index sync failed after delete:', indexResult.error);
         }
 
         return new Response(JSON.stringify({
@@ -222,7 +225,12 @@ export async function deleteStoredFile(env, fileId, img) {
 }
 
 // 删除单个文件的核心函数
-export async function deleteFile(env, fileId, cdnUrl, url) {
+// 顺序：远端存储先删（失败如实报错、记录保留可重试，与之前行为一致；
+// Telegram 渠道本来就没有远端删除动作，这里立即返回，不会拖慢列表刷新）；
+// 再删记录与过期标记、同步清掉随机/公开列表缓存，然后返回成功；
+// CDN 清缓存是网络调用，放后台，不阻塞列表刷新。
+// 记录已删、索引随后由调用方同步合并，链接立即失效。
+export async function deleteFile(env, fileId, cdnUrl, url, waitUntil) {
     try {
         // 纵深防御：系统配置键（manage@ 开头等）禁止删除，批量删除与其它调用方同样受此保护。
         assertDeletableFileId(fileId);
@@ -237,11 +245,12 @@ export async function deleteFile(env, fileId, cdnUrl, url) {
             return { deleted: true, existed: false };
         }
 
+        // 远端存储先删：失败时记录保留、可重试
         if (!await deleteStoredFile(env, fileId, img)) {
             throw new Error('storage channel reported a failed deletion');
         }
 
-        // 删除数据库中的记录
+        // 再删除数据库中的记录：列表立即不再显示。
         // 注意：容量统计现在由索引自动维护，删除文件后索引更新时会自动重新计算
         await db.delete(fileId);
 
@@ -255,13 +264,22 @@ export async function deleteFile(env, fileId, cdnUrl, url) {
             }
         }
 
-        // 清除CDN缓存
-        await purgeCFCache(env, cdnUrl);
-
-        // 清除 api/randomFileList 等API缓存
+        // 随机/公开列表缓存是本地操作，同步清掉，保证刷新后不再出现
         const normalizedFolder = fileId.split('/').slice(0, -1).join('/');
         await purgeRandomFileListCache(url.origin, normalizedFolder);
         await purgePublicFileListCache(url.origin, normalizedFolder);
+
+        // CDN 清缓存是网络调用，放后台，不阻塞列表刷新；无 waitUntil
+        // 时（如单测直接调用）同步执行。
+        const backgroundPurge = (async () => {
+            try {
+                await purgeCFCache(env, cdnUrl);
+            } catch (error) {
+                console.warn(`Background CDN purge failed for ${fileId}:`, error);
+            }
+        })();
+        if (typeof waitUntil === 'function') waitUntil(backgroundPurge);
+        else await backgroundPurge;
 
         return { deleted: true, existed: true };
     } catch (e) {

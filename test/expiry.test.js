@@ -916,7 +916,8 @@ describe('file expiry', () => {
             db.delete = async key => { removed.push(key); };
             await fixture.seed([{ id: 'photo.png', metadata: { Channel: 'CloudflareR2', ExpiresAt: Date.now() + HOUR } }]);
             assert.equal((await patch({ ExpiresAt: null })).status, 200);
-            assert.deepEqual(removed, []);
+            // 索引操作记录的清理不算：只断言没有删过期标记键。
+            assert.deepEqual(removed.filter(key => key.startsWith(helpers.EXPIRY_MARKER_PREFIX)), []);
             assert.equal('ExpiresAt' in (await fixture.db.getWithMetadata('photo.png')).metadata, false);
         });
 

@@ -65,6 +65,12 @@ export function getIndexChunkSize(env) {
  * @param {string} fileId - 文件 ID
  * @param {Object} metadata - 文件元数据
  */
+// 直接合并一次操作是否生效：合并成功、或本次操作已合入但还有剩余操作
+// 待处理、或索引暂不可用（无索引可删/可写，操作已留作下次合并），都算成功。
+function isMergeEffective(mergeResult) {
+    return mergeResult.success || mergeResult.remainingOperations || mergeResult.indexUnavailable;
+}
+
 export async function addFileToIndex(context, fileId, metadata = null) {
     const { env } = context;
     const db = getDatabase(env);
@@ -83,6 +89,14 @@ export async function addFileToIndex(context, fileId, metadata = null) {
         });
 
         console.log(`File ${fileId} add operation recorded with ID: ${operationId}`);
+        // 立即合并：不等下一次列表请求，新上传的文件立即出现在图库。
+        const mergeResult = await mergeOperationsToIndex(context, {
+            extraOperations: [{ id: operationId, type: 'add', timestamp: Date.now(), data: { fileId, metadata } }],
+        });
+        if (!isMergeEffective(mergeResult)) {
+            console.error(`Failed to merge add operation for ${fileId}:`, mergeResult.error);
+            return { success: false, operationId, error: mergeResult.error };
+        }
         return { success: true, operationId };
     } catch (error) {
         console.error('Error recording add file operation:', error);
@@ -134,6 +148,14 @@ export async function batchAddFilesToIndex(context, files, options = {}) {
         });
 
         console.log(`Batch add operation recorded with ID: ${operationId}, ${files.length} files`);
+        // 立即合并一次：整批只合并一次，不反复刷新整个索引。
+        const mergeResult = await mergeOperationsToIndex(context, {
+            extraOperations: [{ id: operationId, type: 'batch_add', timestamp: Date.now(), data: { files: processedFiles, options: { skipExisting } } }],
+        });
+        if (!isMergeEffective(mergeResult)) {
+            console.error('Failed to merge batch add operation:', mergeResult.error);
+            return { success: false, operationId, error: mergeResult.error, totalProcessed: 0 };
+        }
         return {
             success: true,
             operationId,
@@ -162,6 +184,14 @@ export async function removeFileFromIndex(context, fileId) {
         });
 
         console.log(`File ${fileId} remove operation recorded with ID: ${operationId}`);
+        // 立即合并：不等下一次列表请求，刷新后已删文件不会重新出现。
+        const mergeResult = await mergeOperationsToIndex(context, {
+            extraOperations: [{ id: operationId, type: 'remove', timestamp: Date.now(), data: { fileId } }],
+        });
+        if (!isMergeEffective(mergeResult)) {
+            console.error(`Failed to merge remove operation for ${fileId}:`, mergeResult.error);
+            return { success: false, operationId, error: mergeResult.error };
+        }
         return { success: true, operationId };
     } catch (error) {
         console.error('Error recording remove file operation:', error);
@@ -182,6 +212,14 @@ export async function batchRemoveFilesFromIndex(context, fileIds) {
         });
 
         console.log(`Batch remove operation recorded with ID: ${operationId}, ${fileIds.length} files`);
+        // 立即合并一次：整批只合并一次，不反复刷新整个索引。
+        const mergeResult = await mergeOperationsToIndex(context, {
+            extraOperations: [{ id: operationId, type: 'batch_remove', timestamp: Date.now(), data: { fileIds } }],
+        });
+        if (!isMergeEffective(mergeResult)) {
+            console.error('Failed to merge batch remove operation:', mergeResult.error);
+            return { success: false, operationId, error: mergeResult.error, totalProcessed: 0 };
+        }
         return {
             success: true,
             operationId,
@@ -304,25 +342,34 @@ export async function batchMoveFilesInIndex(context, moveOperations) {
  */
 export async function mergeOperationsToIndex(context, options = {}) {
     const { request } = context;
-    const { cleanupAfterMerge = true } = options;
-    
+    const { cleanupAfterMerge = true, extraOperations = [] } = options;
+
     try {
         console.log('Starting operations merge...');
-        
+
         // 获取当前索引
         const currentIndex = await getIndex(context);
         if (currentIndex.success === false) {
             console.error('Failed to get current index for merge');
             return {
                 success: false,
-                error: 'Failed to get current index'
+                error: 'Failed to get current index',
+                indexUnavailable: true
             };
         }
 
         // 获取所有待处理的操作
-        const operationsResult = await getAllPendingOperations(context, currentIndex.lastOperationId);
+        const operationsResult = await getAllPendingOperations(context);
 
-        const operations = operationsResult.operations;
+        // 调用方刚记下的操作可能还没出现在 KV list 结果里（最终一致），
+        // 直接传进来一起合并，不等下一次列表请求；清理时只删 list 里已
+        // 经可见的、已处理的操作 ID，没见过的那条留作保险，下次合并时
+        // 幂等重放再清理。
+        const listedIds = new Set(operationsResult.operations.map(operation => operation.id));
+        const operations = [...operationsResult.operations];
+        for (const extra of extraOperations) {
+            if (!listedIds.has(extra.id)) operations.push(extra);
+        }
         const isALLOperations = operationsResult.isAll;
 
         if (operations.length === 0) {
@@ -427,24 +474,37 @@ export async function mergeOperationsToIndex(context, options = {}) {
             console.log(`Index updated: ${addedCount} added, ${updatedCount} updated, ${removedCount} removed, ${movedCount} moved`);
         }
 
-        // 清理已处理的操作记录
+        // 清理已处理的操作记录：只删 list 里已经可见的；刚传进来的那条
+        // 若 list 还没看到，留着当保险，下次合并幂等重放时再清理。
         if (cleanupAfterMerge && processedOperationIds.length > 0) {
-            await cleanupOperations(context, processedOperationIds);
+            const deletableIds = processedOperationIds.filter(id => listedIds.has(id));
+            if (deletableIds.length > 0) {
+                await cleanupOperations(context, deletableIds);
+            }
         }
 
-        // 如果未处理完所有操作，调用 merge-operations API 递归处理
+        // 如果未处理完所有操作，调用 merge-operations API 递归处理。
+        // 本次的操作已经合入并保存成功，调用方按成功处理（remainingOperations
+        // 标记），list.js 一侧仍能感知“还有剩余操作”。
         if (!isALLOperations) {
             console.log('There are remaining operations, will process them in subsequent calls.');
 
-            const headers = new Headers(request.headers);
-            const originUrl = new URL(request.url);
-            const mergeUrl = `${originUrl.protocol}//${originUrl.host}/api/manage/list?action=merge-operations`;
+            try {
+                const headers = new Headers(request.headers);
+                const originUrl = new URL(request.url);
+                const mergeUrl = `${originUrl.protocol}//${originUrl.host}/api/manage/list?action=merge-operations`;
 
-            await fetch(mergeUrl, { method: 'GET', headers });
+                await fetch(mergeUrl, { method: 'GET', headers });
+            } catch (error) {
+                console.warn('Failed to trigger follow-up merge:', error);
+            }
 
             return {
                 success: false,
-                error: 'There are remaining operations, will process them in subsequent calls.'
+                error: 'There are remaining operations, will process them in subsequent calls.',
+                remainingOperations: true,
+                processedOperations: operationsProcessed,
+                index: workingIndex
             };
         }
 
@@ -758,7 +818,7 @@ export async function readIndex(context, options = {}) {
  * @param {Function} progressCallback - 进度回调函数
  */
 export async function rebuildIndex(context, progressCallback = null) {
-    const { env, waitUntil } = context;
+    const { env } = context;
     const db = getDatabase(env);
 
     try {
@@ -832,7 +892,7 @@ export async function rebuildIndex(context, progressCallback = null) {
         // 清除多余的旧索引分块。重建期间新产生的操作不再删除：
         // 它们在重建扫描之后才产生，下一次合并时会幂等重放（add 是 upsert、
         // remove 是过滤、move 找不到源文件即跳过），删掉就会永久丢失。
-        waitUntil(clearChunkedIndex(context, true));
+        if (typeof context.waitUntil === 'function') context.waitUntil(clearChunkedIndex(context, true));
 
 
         console.log(`Index rebuild completed. Processed ${processedCount} files, indexed ${newIndex.totalCount} files.`);
@@ -1316,9 +1376,13 @@ async function recordOperation(context, type, data) {
 /**
  * 获取所有待处理的操作
  * @param {Object} context - 上下文对象
- * @param {string} lastOperationId - 最后处理的操作ID
+ * 不再按 lastOperationId 跳过操作：操作 ID 是“毫秒时间戳_随机串”，
+ * 同一毫秒内产生的、或时钟有偏差时时间戳更早的操作，字符串比较会
+ * 排在 lastOperationId 之前，被跳过后就再也不会合入索引（删掉的图
+ * 刷新后又出现）。重放是幂等的（add 是 upsert、remove 是过滤、move
+ * 找不到源文件即跳过），全量取回再按时间戳排序应用即可。
  */
-async function getAllPendingOperations(context, lastOperationId = null) {
+async function getAllPendingOperations(context) {
     const { env } = context;
     const db = getDatabase(env);
 
@@ -1338,11 +1402,6 @@ async function getAllPendingOperations(context, lastOperationId = null) {
             });
             
             for (const item of response.keys) {
-                // 如果指定了lastOperationId，跳过已处理的操作
-                if (lastOperationId && item.name <= OPERATION_KEY_PREFIX + lastOperationId) {
-                    continue;
-                }
-                
                 if (operationCount >= MAX_OPERATION_COUNT) {
                     isALL = false; // 达到最大操作数量，停止获取
                     break;
@@ -1664,7 +1723,6 @@ export async function deleteAllOperations(context) {
  * @param {Object} context - 上下文对象
  */
 async function getIndex(context) {
-    const { waitUntil } = context;
     try {
         // 首先尝试加载分块索引
         const index = await loadChunkedIndex(context);
@@ -1672,11 +1730,11 @@ async function getIndex(context) {
             return index;
         } else {
             // 如果加载失败，触发重建索引
-            waitUntil(rebuildIndex(context));
+            if (typeof context.waitUntil === 'function') context.waitUntil(rebuildIndex(context));
         }
     } catch (error) {
         console.warn('Error reading index, creating new one:', error);
-        waitUntil(rebuildIndex(context));
+        if (typeof context.waitUntil === 'function') context.waitUntil(rebuildIndex(context));
     }
     
     // 返回空的索引结构
