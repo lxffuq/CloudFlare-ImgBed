@@ -23,7 +23,7 @@ const corsHeaders = {
 };
 
 export async function onRequest(context) {
-    const { request, env, params, waitUntil } = context;
+    const { request, env, params } = context;
 
     const url = new URL(request.url);
 
@@ -81,9 +81,13 @@ export async function onRequest(context) {
                 }
             }
 
-            // 批量从索引中删除文件
+            // 批量从索引中删除文件。必须等索引操作落盘再返回：以前放进 waitUntil，
+            // 响应先回去了、索引操作还没跑完，用户一刷新列表就又看到这些文件。
             if (deletedFiles.length > 0) {
-                waitUntil(batchRemoveFilesFromIndex(context, deletedFiles));
+                const indexResult = await batchRemoveFilesFromIndex(context, deletedFiles);
+                if (!indexResult.success) {
+                    throw new Error('Failed to update file index: ' + (indexResult.error || 'unknown error'));
+                }
             }
 
             return new Response(JSON.stringify({
@@ -119,7 +123,13 @@ export async function onRequest(context) {
             throw new Error('Delete file failed');
         } else {
             // 记录不存在时也可能有残留索引，因此仍需清理。
-            waitUntil(removeFileFromIndex(context, fileId));
+            // 必须等索引操作落盘再返回成功：以前放进 waitUntil，响应先回去了、
+            // 索引里文件还在，用户一刷新就又看到它。操作失败时直接报错，
+            // 让前端显示删除失败、用户重试（重试时记录已不存在，会再次补记索引操作）。
+            const indexResult = await removeFileFromIndex(context, fileId);
+            if (!indexResult.success) {
+                throw new Error('Failed to update file index: ' + (indexResult.error || 'unknown error'));
+            }
         }
 
         return new Response(JSON.stringify({

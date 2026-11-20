@@ -320,7 +320,7 @@ export async function mergeOperationsToIndex(context, options = {}) {
         }
 
         // 获取所有待处理的操作
-        const operationsResult = await getAllPendingOperations(context, currentIndex.lastOperationId);
+        const operationsResult = await getAllPendingOperations(context);
 
         const operations = operationsResult.operations;
         const isALLOperations = operationsResult.isAll;
@@ -1315,9 +1315,18 @@ async function recordOperation(context, type, data) {
 /**
  * 获取所有待处理的操作
  * @param {Object} context - 上下文对象
- * @param {string} lastOperationId - 最后处理的操作ID
+ *
+ * 注意：这里故意不再按 lastOperationId 做字符串比较来跳过“已处理”的操作。
+ * 操作 ID 是“毫秒时间戳_随机串”，两个隐患会让新操作被永久跳过、再也合并不进索引：
+ * ① 同一毫秒内产生的操作，随机后缀小的会排在已处理的 lastOperationId 之前；
+ * ② 不同节点时钟有毫秒级偏差时，新操作的时间戳可能小于上一次合并记下的 ID。
+ * 一旦被跳过，删除操作丢了 → 列表里删掉的图片刷新后又出现；上传操作丢了 → 图片不显示。
+ * 重放是安全的：add 是 upsert、remove 是过滤、move 找不到原文件就跳过，
+ * 且应用前按时间戳排过序，所以重复应用会收敛到同一状态；合并成功后操作记录
+ * 本来就会被删掉，正常情况下这里列出的就是真正的待处理操作。
+ * lastOperationId 仍写进索引元数据（仅作记录，不再当作游标用）。
  */
-async function getAllPendingOperations(context, lastOperationId = null) {
+async function getAllPendingOperations(context) {
     const { env } = context;
     const db = getDatabase(env);
 
@@ -1337,11 +1346,6 @@ async function getAllPendingOperations(context, lastOperationId = null) {
             });
             
             for (const item of response.keys) {
-                // 如果指定了lastOperationId，跳过已处理的操作
-                if (lastOperationId && item.name <= OPERATION_KEY_PREFIX + lastOperationId) {
-                    continue;
-                }
-                
                 if (operationCount >= MAX_OPERATION_COUNT) {
                     isALL = false; // 达到最大操作数量，停止获取
                     break;

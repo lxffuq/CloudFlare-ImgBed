@@ -25,14 +25,17 @@ export async function onRequest(context) {  // Contents of context object
     const url = new URL(request.url);
     context.url = url;
 
-    // 读取各项配置，存入 context；两处配置读取互不依赖，并行发起
-    const [securityConfig, uploadConfig] = await Promise.all([
+    // 读取各项配置，存入 context；三处配置读取互不依赖，并行发起。
+    // pageConfig 以前在上传流程里才串行读（只为取 urlPrefix），现在一起并行读掉。
+    const [securityConfig, uploadConfig, pageConfig] = await Promise.all([
         fetchSecurityConfig(env),
         fetchUploadConfig(env, context),
+        fetchPageConfig(env),
     ]);
 
     context.securityConfig = securityConfig;
     context.uploadConfig = uploadConfig;
+    context.pageConfig = pageConfig;
 
     // 鉴权
     const requiredPermission = 'upload';
@@ -225,8 +228,8 @@ async function processFileUpload(context, formdata = null) {
         returnLink = `/file/${fullId}`;
     }
 
-    // 构建公开访问链接（使用 urlPrefix 配置）
-    const pageConfig = await fetchPageConfig(context.env);
+    // 构建公开访问链接（使用 urlPrefix 配置；请求开头已并行读过，直接复用）
+    const pageConfig = context.pageConfig || await fetchPageConfig(context.env);
     const urlPrefixConfig = pageConfig.config?.find(c => c.id === 'urlPrefix');
     const urlPrefix = urlPrefixConfig?.value || '';
     context.publicUrl = urlPrefix ? `${urlPrefix.replace(/\/+$/, '')}/${fullId}` : '';
@@ -347,7 +350,7 @@ async function uploadFileToCloudflareR2(context, fullId, metadata, returnLink) {
     // 图像审查，采用R2的publicUrl
     const R2PublicUrl = r2Channel.publicUrl;
     let moderateUrl = `${R2PublicUrl}/${fullId}`;
-    metadata.Label = await moderateContent(env, moderateUrl);
+    metadata.Label = await moderateContent(env, moderateUrl, context.securityConfig);
 
     // 写入数据库
     try {
@@ -433,7 +436,7 @@ async function uploadFileToS3(context, fullId, metadata, returnLink) {
 
             const moderateUrl = `https://${url.hostname}/file/${fullId}`;
             await purgeCDNCache(env, moderateUrl, url);
-            metadata.Label = await moderateContent(env, moderateUrl);
+            metadata.Label = await moderateContent(env, moderateUrl, securityConfig);
         }
 
         // 写入数据库
@@ -545,7 +548,7 @@ async function uploadFileToTelegram(context, fullId, metadata, fileExt, fileName
         // 图像审查（使用代理域名或官方域名）
         const moderateDomain = tgProxyUrl ? `https://${tgProxyUrl}` : 'https://api.telegram.org';
         const moderateUrl = `${moderateDomain}/file/bot${tgBotToken}/${filePath}`;
-        metadata.Label = await moderateContent(env, moderateUrl);
+        metadata.Label = await moderateContent(env, moderateUrl, context.securityConfig);
 
         // 更新metadata，写入KV数据库
         try {
@@ -666,7 +669,7 @@ async function uploadFileToDiscord(context, fullId, metadata, returnLink) {
         if (discordChannel.proxyUrl) {
             moderateUrl = fileInfo.url.replace('https://cdn.discordapp.com', `https://${discordChannel.proxyUrl}`);
         }
-        metadata.Label = await moderateContent(env, moderateUrl);
+        metadata.Label = await moderateContent(env, moderateUrl, context.securityConfig);
 
         // 写入 KV 数据库
         try {
@@ -767,7 +770,7 @@ async function uploadFileToHuggingFace(context, fullId, metadata, returnLink) {
         if (uploadModerate && uploadModerate.enabled) {
             if (!hfChannel.isPrivate) {
                 // 公开仓库：直接通过公开URL访问进行审查，只写入1次KV
-                metadata.Label = await moderateContent(env, result.fileUrl);
+                metadata.Label = await moderateContent(env, result.fileUrl, securityConfig);
             } else {
                 // 私有仓库：先写入KV，再通过自己的域名访问进行审查
                 try {
@@ -778,7 +781,7 @@ async function uploadFileToHuggingFace(context, fullId, metadata, returnLink) {
                 
                 const moderateUrl = `https://${context.url.hostname}/file/${fullId}`;
                 await purgeCDNCache(env, moderateUrl, context.url);
-                metadata.Label = await moderateContent(env, moderateUrl);
+                metadata.Label = await moderateContent(env, moderateUrl, securityConfig);
             }
         }
 
@@ -846,7 +849,7 @@ async function uploadFileToWebDAV(context, fullId, metadata, returnLink) {
         const uploadModerate = securityConfig.upload?.moderate;
         if (uploadModerate && uploadModerate.enabled) {
             if (webdavPublicUrl) {
-                metadata.Label = await moderateContent(env, webdavPublicUrl);
+                metadata.Label = await moderateContent(env, webdavPublicUrl, securityConfig);
             } else {
                 try {
                     await db.put(fullId, "", { metadata });
@@ -856,7 +859,7 @@ async function uploadFileToWebDAV(context, fullId, metadata, returnLink) {
 
                 const moderateUrl = `https://${url.hostname}/file/${fullId}`;
                 await purgeCDNCache(env, moderateUrl, url);
-                metadata.Label = await moderateContent(env, moderateUrl);
+                metadata.Label = await moderateContent(env, moderateUrl, securityConfig);
             }
         }
 

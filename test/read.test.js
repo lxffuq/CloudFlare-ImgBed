@@ -132,6 +132,36 @@ describe('read and list files', () => {
         }
     });
 
+    it('applies pending remove operations even when their id sorts before the last merged operation', async () => {
+        // 回归：操作 ID 是“毫秒时间戳_随机串”，以前合并时按字符串比较跳过
+        // 所有 <= lastOperationId 的操作。同一毫秒内产生的、或时钟有偏差时
+        // 时间戳更早的删除操作会被永久跳过，删掉的图片刷新后又出现在列表里。
+        const index = await loadFunction('functions/utils/indexManager.js', mocks);
+        const files = [{ id: 'victim.png', metadata: { FileName: 'victim.png', FileType: 'image/png', TimeStamp: 1 } }];
+        await db.put('manage@index@meta', JSON.stringify({ chunkCount: 1, totalCount: 1, lastUpdated: 1, lastOperationId: '1700000000000_zzzzzzz' }));
+        await db.put('manage@index_0', JSON.stringify(files));
+        // 同一毫秒、随机后缀更小：字符串比较下排在 lastOperationId 之前。
+        await db.put('manage@index@operation_1700000000000_aaaaaaa', JSON.stringify({ type: 'remove', timestamp: 1700000000000, data: { fileId: 'victim.png' } }));
+        const ctx = context('https://test/api/manage/list');
+        const result = await index.readIndex(ctx, { count: -1 });
+        assert.equal(result.success, true);
+        assert.deepEqual(result.files, []);
+    });
+
+    it('applies pending remove operations recorded with an earlier timestamp than the last merged operation', async () => {
+        // 回归：不同节点时钟有毫秒级偏差时，新操作的时间戳可能小于 lastOperationId，
+        // 以前也会被跳过，删掉的图片刷新后又出现。
+        const index = await loadFunction('functions/utils/indexManager.js', mocks);
+        const files = [{ id: 'victim.png', metadata: { FileName: 'victim.png', FileType: 'image/png', TimeStamp: 1 } }];
+        await db.put('manage@index@meta', JSON.stringify({ chunkCount: 1, totalCount: 1, lastUpdated: 1, lastOperationId: '1700000000000_zzzzzzz' }));
+        await db.put('manage@index_0', JSON.stringify(files));
+        await db.put('manage@index@operation_1699999999999_zzzzzzz', JSON.stringify({ type: 'remove', timestamp: 1699999999999, data: { fileId: 'victim.png' } }));
+        const ctx = context('https://test/api/manage/list');
+        const result = await index.readIndex(ctx, { count: -1 });
+        assert.equal(result.success, true);
+        assert.deepEqual(result.files, []);
+    });
+
     it('preserves GET/HEAD/Range response behavior and Content-Type parameters without historical inference', async () => {
         const route = await loadFunction('functions/file/[[path]].js', {
             ...mocks, ...fileTools, ...imageTransform,

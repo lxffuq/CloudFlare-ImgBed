@@ -128,11 +128,11 @@ async function startMerge(context, uploadId, totalChunks, originalFileName, orig
             // 清理上传会话
             await cleanupUploadSession(env, uploadId);
 
-            // 构建公开访问链接（使用 urlPrefix 配置）
+            // 构建公开访问链接（使用 urlPrefix 配置；上传入口已并行读过，直接复用）
             if (result.result && result.result.length > 0) {
                 const src = result.result[0].src;
                 const fileName = src.startsWith('/file/') ? src.slice(6) : src.split('/file/').pop();
-                const pageConfig = await fetchPageConfig(env);
+                const pageConfig = context.pageConfig || await fetchPageConfig(env);
                 const urlPrefixConfig = pageConfig.config?.find(c => c.id === 'urlPrefix');
                 const urlPrefix = urlPrefixConfig?.value || '';
                 if (urlPrefix) {

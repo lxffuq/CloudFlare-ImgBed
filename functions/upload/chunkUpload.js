@@ -1028,12 +1028,14 @@ export async function cleanupFailedMultipartUploads(context, uploadId, uploadCha
 
 // 检查分块上传状态
 export async function checkChunkUploadStatuses(env, uploadId, totalChunks) {
-    const chunkStatuses = [];
     const currentTime = Date.now();
 
     const db = getDatabase(env);
 
-    for (let i = 0; i < totalChunks; i++) {
+    // 各分块的状态读取互不依赖，并行发起：以前是串行一个一个读，
+    // 大文件分块多时光状态检查就要等几十次 KV 往返，合并被拖慢。
+    // Promise.all 保持返回顺序与分块下标一致。
+    const chunkStatuses = await Promise.all(Array.from({ length: totalChunks }, async (_, i) => {
         const chunkKey = `chunk_${uploadId}_${i.toString().padStart(3, '0')}`;
         try {
             const chunkRecord = await db.getWithMetadata(chunkKey, { type: 'arrayBuffer' });
@@ -1072,7 +1074,7 @@ export async function checkChunkUploadStatuses(env, uploadId, totalChunks) {
                     hasData = (chunkRecord.value && chunkRecord.value.byteLength > 0);
                 }
 
-                chunkStatuses.push({
+                return {
                     index: i,
                     key: chunkKey,
                     status: status,
@@ -1085,25 +1087,25 @@ export async function checkChunkUploadStatuses(env, uploadId, totalChunks) {
                     timeoutThreshold: chunkRecord.metadata.timeoutThreshold,
                     uploadChannel: chunkRecord.metadata.uploadChannel,
                     isTimeout: status === 'timeout'
-                });
+                };
             } else {
-                chunkStatuses.push({
+                return {
                     index: i,
                     key: chunkKey,
                     status: 'missing',
                     hasData: false
-                });
+                };
             }
         } catch (error) {
-            chunkStatuses.push({
+            return {
                 index: i,
                 key: chunkKey,
                 status: 'error',
                 error: error.message,
                 hasData: false
-            });
+            };
         }
-    }
+    }));
 
     return chunkStatuses;
 }

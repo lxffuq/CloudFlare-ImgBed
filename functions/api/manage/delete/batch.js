@@ -40,7 +40,12 @@ export async function onRequest(context) {
         const missing = results.filter((item) => item.success && !item.existed).map((item) => item.fileId);
         const failed = results.filter((item) => !item.success).map(({ fileId, error }) => ({ fileId, error }));
         if (deleted.length > 0) {
-            context.waitUntil(batchRemoveFilesFromIndex(context, deleted));
+            // 必须等索引操作落盘再返回成功，原因同单文件删除：放进 waitUntil 的话，
+            // 响应先回去了、索引里文件还在，用户一刷新就又看到它们。
+            const indexResult = await batchRemoveFilesFromIndex(context, deleted);
+            if (!indexResult.success) {
+                return jsonResponse({ success: false, error: 'Failed to update file index: ' + (indexResult.error || 'unknown error'), deleted, missing, failed, details: results }, 500);
+            }
         }
         return jsonResponse({ success: failed.length === 0, deleted, missing, failed, details: results });
     } catch (error) {

@@ -30,6 +30,19 @@ describe('delete files', () => {
         });
     }
 
+    it('removes the file from the index before responding, without relying on background tasks', async () => {
+        // 回归：以前索引删除操作放进 waitUntil，响应先回去了、索引里文件还在，
+        // 用户一刷新列表就又看到删掉的图片。现在响应前必须落盘。
+        await fixture.seed([{ id: 'photo.png', metadata: { Channel: 'CloudflareR2', FileType: 'image/png' } }]);
+        const ctx = context('photo.png');
+        const response = await single.onRequest(ctx);
+        assert.equal(response.status, 200);
+        assert.deepEqual(ctx.backgroundTasks, []);
+        const index = await fixture.mocks.readIndex(ctx, { count: -1, includeSubdirFiles: true });
+        assert.equal(index.success, true);
+        assert.deepEqual(index.files, []);
+    });
+
     it('deletes the R2 object, database record and index entry and invalidates caches', async () => {
         const id = '相册/photo.png';
         const expiresAt = Date.now() + 86400000;
