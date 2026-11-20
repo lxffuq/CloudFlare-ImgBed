@@ -681,24 +681,24 @@ export async function readIndex(context, options = {}) {
         }
 
         // 如果只需要总数
-        if (countOnly) {
-            return {
-                totalCount: filteredFiles.length,
-                indexLastUpdated: index.lastUpdated
-            };
-        }
-
-        // 分页处理
-        const totalCount = filteredFiles.length;
-
-        let resultFiles = filteredFiles;
-
         // 计算当前目录下的直接文件（不包含子目录文件）
         const directFiles = filteredFiles.filter(file => {
             const fileDir = file.metadata.Directory ? file.metadata.Directory : extractDirectory(file.id);
             return fileDir === dirPrefix;
         });
         const directFileCount = directFiles.length;
+        // 非递归时总数只计直接文件：子目录文件按页翻不到，计入总数会让分页多出空页。
+        const totalCount = includeSubdirFiles ? filteredFiles.length : directFiles.length;
+
+        if (countOnly) {
+            return {
+                totalCount,
+                indexLastUpdated: index.lastUpdated
+            };
+        }
+
+        // 分页处理
+        let resultFiles = filteredFiles;
 
         // 如果不包含子目录文件，获取当前目录下的直接文件
         if (!includeSubdirFiles) {
@@ -829,8 +829,9 @@ export async function rebuildIndex(context, progressCallback = null) {
             };
         }
 
-        // 清除旧的操作记录和多余索引
-        waitUntil(deleteAllOperations(context));
+        // 清除多余的旧索引分块。重建期间新产生的操作不再删除：
+        // 它们在重建扫描之后才产生，下一次合并时会幂等重放（add 是 upsert、
+        // remove 是过滤、move 找不到源文件即跳过），删掉就会永久丢失。
         waitUntil(clearChunkedIndex(context, true));
 
 
@@ -1896,18 +1897,18 @@ async function saveChunkedIndex(context, index) {
         let totalSizeMB = 0;
         
         for (const file of files) {
-            const channelName = file.metadata?.ChannelName;
+            // 缺 ChannelName 的老文件回退用 Channel，再没有则归入 unknown 桶，
+            // 否则 totalSizeMB 与各渠道 usedMB 之和对不上。
+            const channelName = file.metadata?.ChannelName || file.metadata?.Channel || 'unknown';
             const fileSize = parseFloat(file.metadata?.FileSize) || 0;
             
             totalSizeMB += fileSize;
             
-            if (channelName) {
-                if (!channelStats[channelName]) {
-                    channelStats[channelName] = { usedMB: 0, fileCount: 0 };
-                }
-                channelStats[channelName].usedMB += fileSize;
-                channelStats[channelName].fileCount += 1;
+            if (!channelStats[channelName]) {
+                channelStats[channelName] = { usedMB: 0, fileCount: 0 };
             }
+            channelStats[channelName].usedMB += fileSize;
+            channelStats[channelName].fileCount += 1;
         }
         
         // 保存索引元数据（包含容量统计）
@@ -1920,16 +1921,35 @@ async function saveChunkedIndex(context, index) {
             chunkCount: chunks.length,
             chunkSize: chunkSize
         };
-        
-        await db.put(INDEX_META_KEY, JSON.stringify(metadata));
-        
-        // 保存各个分块
+
+        // 先记下旧元数据的分块数，保存成功后再清理多余旧分块。
+        let oldChunkCount = 0;
+        try {
+            const oldMetaStr = await db.get(INDEX_META_KEY);
+            if (oldMetaStr) oldChunkCount = JSON.parse(oldMetaStr).chunkCount || 0;
+        } catch {
+            // 旧元数据读不到时不清理，只保证新索引完整。
+        }
+
+        // 先写全部分块并校验成功，最后再写元数据：中途失败时旧元数据仍指向
+        // 旧分块，索引保持完整；之前先写元数据再写分块，失败即损坏。
         const savePromises = chunks.map((chunk, chunkId) => {
             const chunkKey = `${INDEX_KEY}_${chunkId}`;
             return db.put(chunkKey, JSON.stringify(chunk));
         });
         
         await Promise.all(savePromises);
+
+        await db.put(INDEX_META_KEY, JSON.stringify(metadata));
+
+        // 新元数据已生效，再删除超出新分块数的旧分块。
+        if (oldChunkCount > chunks.length) {
+            const deletePromises = [];
+            for (let chunkId = chunks.length; chunkId < oldChunkCount; chunkId++) {
+                deletePromises.push(db.delete(`${INDEX_KEY}_${chunkId}`).catch(() => {}));
+            }
+            await Promise.all(deletePromises);
+        }
         
         console.log(`Saved chunked index: ${chunks.length} chunks, ${files.length} total files, ${totalSizeMB.toFixed(2)} MB`);
         return true;
@@ -1965,10 +1985,12 @@ async function loadChunkedIndex(context) {
             const chunkKey = `${INDEX_KEY}_${chunkId}`;
             loadPromises.push(
                 db.get(chunkKey).then(chunkStr => {
-                    if (chunkStr) {
-                        return JSON.parse(chunkStr);
+                    if (!chunkStr) {
+                        // 缺失分块直接报错触发重建，不再静默当成空数组
+                        // （否则缺失分块里的文件会静默消失）。
+                        throw new Error(`Index chunk ${chunkId} is missing`);
                     }
-                    return [];
+                    return JSON.parse(chunkStr);
                 })
             );
         }

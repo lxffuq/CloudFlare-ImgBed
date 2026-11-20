@@ -40,10 +40,14 @@ export async function onRequestGet(context) {
 
         // 读取现有安全配置
         const settingsStr = await db.get('manage@sysConfig@security');
+        let tokensRevoked = 0;
         if (settingsStr) {
             const settings = JSON.parse(settingsStr);
             // 只清除认证信息，保留其他安全设置（审核、域名白名单等）
             delete settings.auth;
+            // 一并吊销全部 API Token（含 internal token），否则旧 Token 仍可调管理接口
+            tokensRevoked = Object.keys(settings.apiTokens?.tokens || {}).length;
+            delete settings.apiTokens;
             await db.put('manage@sysConfig@security', JSON.stringify(settings));
         }
 
@@ -53,8 +57,10 @@ export async function onRequestGet(context) {
 
         return new Response(JSON.stringify({
             success: true,
-            message: 'Auth credentials reset. Other security settings preserved. All sessions cleared.',
-            sessionsCleared: { admin: adminDestroyed, user: userDestroyed }
+            message: 'Auth credentials reset. Other security settings preserved. All sessions cleared and all API tokens revoked.',
+            sessionsCleared: { admin: adminDestroyed, user: userDestroyed },
+            tokensRevoked,
+            note: 'Credentials configured via environment variables (BASIC_USER / BASIC_PASS / AUTH_CODE) are still valid and must be changed or removed separately.'
         }), {
             status: 200,
             headers: { 'Content-Type': 'application/json' },

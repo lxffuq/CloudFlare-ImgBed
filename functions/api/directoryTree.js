@@ -22,7 +22,14 @@ export async function onRequestGet(context) {
     const url = new URL(request.url);
     
     // 双重鉴权：用户端或管理端任意一个通过即可
-    const authResult = await dualAuthCheck(env, url, request);
+    // Token 调用本端点至少需要 list 权限（不再等同管理员）
+    const authResult = await dualAuthCheck(env, url, request, { requiredPermission: 'list' });
+    if (authResult.configError) {
+        return new Response(JSON.stringify({ error: 'Security config unavailable' }), {
+            status: 503,
+            headers: { 'Content-Type': 'application/json' },
+        });
+    }
     if (!authResult.authorized) {
         return new Response('Unauthorized', { status: 401 });
     }
@@ -44,8 +51,16 @@ export async function onRequestGet(context) {
     
     try {
         const tree = await getDirectoryTree(context);
-        const cacheTime = url.searchParams.get('cacheTime') || 60;
-        
+        // cacheTime 必须是 0–3600 的整数，非法值用默认 60，避免拼出非法响应头或超长缓存
+        const rawCacheTime = url.searchParams.get('cacheTime');
+        let cacheTime = 60;
+        if (rawCacheTime !== null) {
+            const parsed = Number(rawCacheTime);
+            if (Number.isFinite(parsed)) {
+                cacheTime = Math.min(3600, Math.max(0, Math.trunc(parsed)));
+            }
+        }
+
         return new Response(JSON.stringify({ tree }), {
             headers: {
                 'Content-Type': 'application/json',

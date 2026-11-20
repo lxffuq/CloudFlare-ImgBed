@@ -1,12 +1,35 @@
 import { createS3Client } from '../utils/storage/s3Client.js';
 /* ========== 分块合并处理 ========== */
-import { createResponse, createUploadResponse, checkUploadFormat, getUploadIp, getIPAddress, selectConsistentChannel, buildUniqueFileId, endUpload, sanitizeUploadFolder } from './uploadTools';
-import { retryFailedChunks, cleanupFailedMultipartUploads, checkChunkUploadStatuses, cleanupChunkData, cleanupUploadSession } from './chunkUpload';
+import { createResponse, createUploadResponse, checkUploadFormat, getUploadIp, getIPAddress, selectConsistentChannel, buildUniqueFileId, endUpload, sanitizeUploadFolder, isFileIdReserved } from './uploadTools';
+import { retryFailedChunks, cleanupFailedMultipartUploads, checkChunkUploadStatuses, cleanupChunkData, cleanupUploadSession, checkSessionOwnership, MAX_TOTAL_CHUNKS } from './chunkUpload';
 import { CompleteMultipartUploadCommand } from "@aws-sdk/client-s3";
 import { getDatabase } from '../utils/databaseAdapter.js';
 import { fetchPageConfig } from '../utils/sysConfig.js';
 import { resolveFileType } from '../utils/mimeTypes.js';
 import { resolveUploadExpiry } from '../utils/fileExpiryService.js';
+
+// P0-12：已合并结果的记录键。合并成功后先写这条、再清会话与分块；
+// 客户端超时重发合并时直接返回第一次的结果，不再拼出第二个文件。
+function mergeResultKey(uploadId) {
+    return `merge_result_${uploadId}`;
+}
+
+// P0-12/P1-36：合并失败只清 merging 占位，分块与会话一律保留到会话过期，
+// 供用户重试合并（以前失败就全清，重试只能从头传）。
+async function clearMergingFlag(env, uploadId) {
+    try {
+        const db = getDatabase(env);
+        const sessionKey = `upload_session_${uploadId}`;
+        const sessionData = await db.get(sessionKey);
+        if (!sessionData) return;
+        const sessionInfo = JSON.parse(sessionData);
+        if (!sessionInfo.merging) return;
+        delete sessionInfo.merging;
+        await db.put(sessionKey, JSON.stringify(sessionInfo), { expirationTtl: 3600 });
+    } catch (error) {
+        console.warn(`Failed to clear merging flag for ${uploadId}:`, error);
+    }
+}
 
 // 处理分块合并
 export async function handleChunkMerge(context) {
@@ -20,12 +43,26 @@ export async function handleChunkMerge(context) {
     let uploadId, totalChunks, originalFileName, originalFileType, uploadChannel;
     try {
         uploadId = formdata.get('uploadId');
-        totalChunks = parseInt(formdata.get('totalChunks'));
+        // P1-33/34：totalChunks 必须是 1–200 的整数
+        totalChunks = Number(formdata.get('totalChunks'));
         originalFileName = formdata.get('originalFileName');
         originalFileType = formdata.get('originalFileType');
 
-        if (!uploadId || !totalChunks || !originalFileName) {
+        if (!uploadId || !Number.isInteger(totalChunks) || totalChunks < 1 || totalChunks > MAX_TOTAL_CHUNKS || !originalFileName) {
             return createResponse('Error: Missing merge parameters', { status: 400 });
+        }
+
+        // P0-12：已合并过直接返回第一次的结果（客户端超时重发合并时幂等）
+        const previousResultRaw = await db.get(mergeResultKey(uploadId));
+        if (previousResultRaw) {
+            try {
+                const previousResult = JSON.parse(previousResultRaw);
+                if (Array.isArray(previousResult?.result)) {
+                    return createUploadResponse(context, previousResult.result);
+                }
+            } catch (e) {
+                // 记录损坏时继续走正常合并流程
+            }
         }
 
         // 验证上传会话
@@ -36,36 +73,68 @@ export async function handleChunkMerge(context) {
         }
 
         const sessionInfo = JSON.parse(sessionData);
+
+        // P0-10：合并校验会话归属
+        if (!checkSessionOwnership(sessionInfo, request)) {
+            return createResponse('Error: Upload session belongs to another client', { status: 403 });
+        }
+
+        // P0-12：合并前用会话记录原子占位 merging（带过期）。已有未过期的
+        // 合并在跑时直接 409，不让两次并发合并各拼出一个文件。
+        // 注：KV/D1 没有 CAS，占位只能把竞态窗口缩得很小，残余并发见汇报。
+        if (sessionInfo.merging && sessionInfo.merging.expiresAt > Date.now()) {
+            return createResponse('Error: Merge already in progress', { status: 409 });
+        }
+        sessionInfo.merging = { startedAt: Date.now(), expiresAt: Date.now() + 300000 };
+        await db.put(sessionKey, JSON.stringify(sessionInfo), { expirationTtl: 3600 });
+
         // 未重复发送类型时沿用会话中的明确类型，再对通用值按文件名兜底。
         originalFileType = resolveFileType(originalFileName, originalFileType || sessionInfo.originalFileType);
 
         // 验证会话信息
         if (sessionInfo.originalFileName !== originalFileName ||
             sessionInfo.totalChunks !== totalChunks) {
+            await clearMergingFlag(env, uploadId);
             return createResponse('Error: Session parameters mismatch', { status: 400 });
         }
 
         const formatError = checkUploadFormat(sessionInfo.originalFileName, context.uploadConfig);
-        if (formatError) return formatError;
+        if (formatError) {
+            await clearMergingFlag(env, uploadId);
+            return formatError;
+        }
 
         // 检查会话是否过期
         if (Date.now() > sessionInfo.expiresAt) {
+            await clearMergingFlag(env, uploadId);
             return createResponse('Error: Upload session expired', { status: 410 });
         }
 
+        // P1-35：渠道与渠道名以初始化会话为准，中途换渠道直接 400
+        const requestedChannel = url.searchParams.get('uploadChannel');
+        if (requestedChannel && requestedChannel !== sessionInfo.uploadChannel) {
+            await clearMergingFlag(env, uploadId);
+            return createResponse('Error: uploadChannel does not match the initialized session', { status: 400 });
+        }
+        const requestedChannelName = url.searchParams.get('channelName');
+        if (requestedChannelName && sessionInfo.channelName && requestedChannelName !== sessionInfo.channelName) {
+            await clearMergingFlag(env, uploadId);
+            return createResponse('Error: channelName does not match the initialized session', { status: 400 });
+        }
         // 使用会话中的上传渠道，或者从URL参数获取
-        uploadChannel = url.searchParams.get('uploadChannel') || sessionInfo.uploadChannel || 'telegram';
+        uploadChannel = sessionInfo.uploadChannel || requestedChannel || 'telegram';
         if (uploadChannel === 'webdav') {
             return createResponse('Error: WebDAV channel does not support chunked uploads. Please use non-chunked upload within your Cloudflare request body limit.', { status: 400 });
         }
 
         // 获取指定的渠道名称（优先URL参数，其次会话信息）
-        const channelName = url.searchParams.get('channelName') || sessionInfo.channelName || '';
+        const channelName = sessionInfo.channelName || requestedChannelName || '';
         context.specifiedChannelName = channelName;
 
         // 文件有效期由后端按设置决定（合并请求需携带与初始化时相同的 expire 参数）
         const expiry = await resolveUploadExpiry(context);
         if (expiry.error) {
+            await clearMergingFlag(env, uploadId);
             return createResponse(expiry.error, { status: 400 });
         }
         context.fileExpiresAt = expiry.expiresAt;
@@ -80,20 +149,18 @@ export async function handleChunkMerge(context) {
         }, {});
         console.log(`Initial chunk status summary: ${JSON.stringify(initialStatusSummary)}`);
 
+        // P1-36：还有分块在传时合并返回 409“仍在上传”，不要清数据
+        if (chunkStatuses.some(chunk => chunk.status === 'uploading' || chunk.status === 'retrying')) {
+            await clearMergingFlag(env, uploadId);
+            return createResponse('Error: Chunks are still uploading', { status: 409 });
+        }
+
         // 开始合并处理
         return await startMerge(context, uploadId, totalChunks, originalFileName, originalFileType, uploadChannel);
 
     } catch (error) {
-        // 清理失败的multipart uploads
-        if (uploadChannel === 'cfr2' || uploadChannel === 's3') {
-            waitUntil(cleanupFailedMultipartUploads(context, uploadId, uploadChannel));
-        }
-
-        // 清理临时分块数据
-        waitUntil(cleanupChunkData(env, uploadId, totalChunks));
-
-        // 清理上传会话
-        waitUntil(cleanupUploadSession(env, uploadId));
+        // 合并失败保留分块与会话，只清 merging 占位，供用户重试合并
+        await clearMergingFlag(env, uploadId);
 
         return createResponse(`Error: Failed to merge chunks - ${error.message}`, { status: 500 });
     }
@@ -102,6 +169,7 @@ export async function handleChunkMerge(context) {
 // 开始合并处理
 async function startMerge(context, uploadId, totalChunks, originalFileName, originalFileType, uploadChannel) {
     const { env } = context;
+    const db = getDatabase(env);
 
     try {
         // 合并任务状态输出
@@ -122,12 +190,6 @@ async function startMerge(context, uploadId, totalChunks, originalFileName, orig
         const result = await handleChannelBasedMerge(context, uploadId, totalChunks, originalFileName, originalFileType, uploadChannel);
 
         if (result.success) {
-            // 清理临时分块数据
-            await cleanupChunkData(env, uploadId, totalChunks);
-
-            // 清理上传会话
-            await cleanupUploadSession(env, uploadId);
-
             // 构建公开访问链接（使用 urlPrefix 配置）
             if (result.result && result.result.length > 0) {
                 const src = result.result[0].src;
@@ -143,22 +205,26 @@ async function startMerge(context, uploadId, totalChunks, originalFileName, orig
                 }
             }
 
+            // P0-12：先把合并结果记下来、再清会话与分块，重发合并直接返回这条
+            await db.put(`merge_result_${uploadId}`, JSON.stringify({ result: result.result }), {
+                expirationTtl: 3600
+            });
+
+            // 清理临时分块数据
+            await cleanupChunkData(env, uploadId, totalChunks);
+
+            // 清理上传会话
+            await cleanupUploadSession(env, uploadId);
+
             return createUploadResponse(context, result.result);
         } else {
             throw new Error(result.error || 'Merge failed');
         }
 
     } catch (error) {
-        // 清理失败的multipart uploads
-        if (uploadChannel === 'cfr2' || uploadChannel === 's3') {
-            await cleanupFailedMultipartUploads(context, uploadId, uploadChannel);
-        }
-
-        // 清理分块数据
-        await cleanupChunkData(env, uploadId, totalChunks);
-
-        // 清理上传会话
-        await cleanupUploadSession(env, uploadId);
+        // P1-36：合并失败保留分块、会话与 multipart，只清 merging 占位，
+        // 供用户重试合并（以前失败就全清，重试只能从头传）
+        await clearMergingFlag(env, uploadId);
 
         return createResponse(`Error: Failed to merge chunks - ${error.message}`, { status: 500 });
     }
@@ -167,6 +233,7 @@ async function startMerge(context, uploadId, totalChunks, originalFileName, orig
 // 基于渠道的合并处理
 async function handleChannelBasedMerge(context, uploadId, totalChunks, originalFileName, originalFileType, uploadChannel) {
     const { request, env, url } = context;
+    const db = getDatabase(env);
 
     try {
         // 获得上传IP
@@ -232,6 +299,58 @@ async function handleChannelBasedMerge(context, uploadId, totalChunks, originalF
             }, {});
 
             throw new Error(`Only ${completedChunks.length}/${totalChunks} chunks completed successfully. Final status: ${JSON.stringify(finalStatusSummary)}`);
+        }
+
+        // P1-35：合并前校验每个 completed 分块含有所选渠道必需字段，
+        // 缺失即报错不写库（中途换渠道拼出的死链到此为止）
+        const requiredFields = uploadChannel === 'cfr2' || uploadChannel === 's3'
+            ? ['etag', 'partNumber']
+            : uploadChannel === 'telegram' ? ['fileId']
+            : uploadChannel === 'discord' ? ['messageId'] : [];
+        for (const chunk of completedChunks) {
+            for (const field of requiredFields) {
+                if (!chunk.uploadResult || chunk.uploadResult[field] === undefined || chunk.uploadResult[field] === null) {
+                    throw new Error(`Chunk ${chunk.index} is missing ${field} for ${uploadChannel}`);
+                }
+            }
+        }
+
+        // P1-48：逐块核对大小。每块 uploadResult.size 必须与上传时记的
+        // chunkSize 一致；除最后一块外各块大小必须相等（前端均匀切片）；
+        // 会话里有 fileSize 时总和必须等于它；初始化传了 chunkHashes 的
+        // 逐块核对哈希。前端目前不传每块哈希，哈希核对默认跳过，只做大小核对。
+        for (const chunk of completedChunks) {
+            if (chunk.chunkSize !== undefined && chunk.chunkSize <= 0) {
+                throw new Error(`Chunk ${chunk.index} has invalid size`);
+            }
+            if (chunk.chunkSize !== undefined && chunk.uploadResult?.size !== undefined &&
+                chunk.uploadResult.size !== chunk.chunkSize) {
+                throw new Error(`Chunk ${chunk.index} size mismatch: expected ${chunk.chunkSize}, got ${chunk.uploadResult.size}`);
+            }
+        }
+        const sortedForSizeCheck = [...completedChunks].sort((a, b) => a.index - b.index);
+        for (let i = 0; i + 1 < sortedForSizeCheck.length; i++) {
+            const sizeA = sortedForSizeCheck[i].chunkSize;
+            const sizeB = sortedForSizeCheck[i + 1].chunkSize;
+            if (sizeA !== undefined && sizeB !== undefined && sizeA !== sizeB) {
+                throw new Error(`Chunk ${sortedForSizeCheck[i + 1].index} size ${sizeB} differs from previous chunks (${sizeA}); chunks other than the last must be equal size`);
+            }
+        }
+        const sessionRawForMerge = await db.get(`upload_session_${uploadId}`);
+        const sessionForMerge = sessionRawForMerge ? JSON.parse(sessionRawForMerge) : null;
+        if (sessionForMerge?.fileSize) {
+            const totalSize = completedChunks.reduce((sum, chunk) => sum + (chunk.uploadResult?.size ?? chunk.chunkSize ?? 0), 0);
+            if (totalSize !== sessionForMerge.fileSize) {
+                throw new Error(`Total size mismatch: expected ${sessionForMerge.fileSize}, got ${totalSize}`);
+            }
+        }
+        if (sessionForMerge?.chunkHashes) {
+            for (const chunk of completedChunks) {
+                const expectedHash = sessionForMerge.chunkHashes[chunk.index];
+                if (expectedHash && chunk.chunkSha256 && chunk.chunkSha256.toLowerCase() !== expectedHash.toLowerCase()) {
+                    throw new Error(`Chunk ${chunk.index} hash mismatch`);
+                }
+            }
         }
 
         // 根据渠道合并分块信息
@@ -470,6 +589,12 @@ async function mergeTelegramChunksInfo(context, uploadId, completedChunks, metad
         // 生成 finalFileId
         const finalFileId = await buildUniqueFileId(context, metadata.FileName, metadata.FileType);
 
+        // P0-9：写库前校验占位仍属于本次上传；占位过期（极少见）时报错，
+        // 由调用方重试合并重新生成 ID，不直接覆盖。
+        if (!(await isFileIdReserved(db, finalFileId))) {
+            throw new Error('File ID reservation expired, please retry merge');
+        }
+
         // 更新metadata
         metadata.Channel = "TelegramNew";
         metadata.ChannelName = tgChannel.name;
@@ -543,6 +668,12 @@ async function mergeDiscordChunksInfo(context, uploadId, completedChunks, metada
 
         // 生成 finalFileId
         const finalFileId = await buildUniqueFileId(context, metadata.FileName, metadata.FileType);
+
+        // P0-9：写库前校验占位仍属于本次上传；占位过期（极少见）时报错，
+        // 由调用方重试合并重新生成 ID，不直接覆盖。
+        if (!(await isFileIdReserved(db, finalFileId))) {
+            throw new Error('File ID reservation expired, please retry merge');
+        }
 
         // 更新metadata
         metadata.Channel = "Discord";

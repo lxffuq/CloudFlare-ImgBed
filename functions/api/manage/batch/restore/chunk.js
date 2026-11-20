@@ -6,6 +6,8 @@
 
 import { getDatabase } from '../../../../utils/databaseAdapter.js';
 import { cleanPersistedMetadata } from '../../../../utils/metadata/metadataSecurity.js';
+import { batchAddFilesToIndex } from '../../../../utils/indexManager.js';
+import { purgePublicFileListCache, purgeRandomFileListCache } from '../../../../utils/purgeCache.js';
 
 // CORS 跨域响应头
 const corsHeaders = {
@@ -72,6 +74,7 @@ export async function onRequestPost(context) {
 
     if (type === 'files') {
       // 恢复文件数据 - 并行写入
+      const restoredFiles = [];
       const filePromises = Object.entries(data).map(async ([key, fileData]) => {
         try {
           const metadata = cleanPersistedMetadata(fileData.metadata);
@@ -86,6 +89,7 @@ export async function onRequestPost(context) {
               metadata
             });
           }
+          restoredFiles.push({ fileId: key, metadata });
           return { success: true };
         } catch (error) {
           return { success: false, key, error: error.message };
@@ -100,6 +104,33 @@ export async function onRequestPost(context) {
           failedCount++;
           errors.push({ key: result.key, error: result.error });
         }
+      }
+
+      // 只写 KV 记录不够：恢复的文件还要写进索引、清掉随机图/公开列表缓存，
+      // 否则在列表、随机图、公开浏览里都不出现，必须手动重建索引才可见。
+      // 系统键与临时分块键不进索引。
+      const indexFiles = restoredFiles.filter(file =>
+        !file.fileId.startsWith('manage@') && !file.fileId.startsWith('chunk_'));
+      if (indexFiles.length > 0) {
+        const indexed = await batchAddFilesToIndex(context, indexFiles, { skipExisting: false });
+        if (!indexed.success) {
+          console.error('Failed to add restored files to index:', indexed.error);
+        }
+        // 清相关目录及祖先目录的随机/公开列表缓存（与打标签处同款做法）。
+        const dirs = new Set(['']);
+        for (const file of indexFiles) {
+          const dir = file.fileId.split('/').slice(0, -1).join('/');
+          dirs.add(dir);
+          const segments = dir.split('/').filter(Boolean);
+          while (segments.length > 1) { segments.pop(); dirs.add(segments.join('/')); }
+        }
+        const origin = new URL(request.url).origin;
+        const invalidation = Promise.all([
+          purgePublicFileListCache(origin, ...dirs),
+          purgeRandomFileListCache(origin, ...dirs),
+        ]);
+        if (context.waitUntil) context.waitUntil(invalidation);
+        else await invalidation;
       }
     } else if (type === 'settings') {
       // 恢复系统设置 - 并行写入

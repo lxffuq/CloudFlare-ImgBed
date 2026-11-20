@@ -3,7 +3,7 @@ import { getDatabase } from '../../../utils/databaseAdapter.js';
 import { buildFileMetadataForManagement } from '../../../utils/metadata/metadataView.js';
 import { cleanPersistedMetadata } from '../../../utils/metadata/metadataSecurity.js';
 import { buildExpiryMarkerKey, getExpiresAt, isExpired } from '../../../utils/fileExpiryHelpers.js';
-import { purgeCFCache } from '../../../utils/purgeCache.js';
+import { purgeCFCache, purgePublicFileListCache, purgeRandomFileListCache } from '../../../utils/purgeCache.js';
 
 // CORS 跨域响应头
 const corsHeaders = {
@@ -150,6 +150,22 @@ export async function onRequest(context) {
         if ((newExpiresAt ?? Infinity) < (oldExpiresAt ?? Infinity)) {
             const url = new URL(request.url);
             waitUntil(purgeCFCache(env, `https://${url.hostname}/file/${fileId}`));
+        }
+
+        // 元数据变更（改类型/有效期等）后也要清随机图和公开列表缓存，
+        // 否则公开浏览/随机图里 24 小时内仍按旧的展示；一并清祖先目录
+        // （与 tagService.js 打标签处同款做法）。
+        {
+            const url = new URL(request.url);
+            const dirs = new Set(['']);
+            const dir = fileId.split('/').slice(0, -1).join('/');
+            dirs.add(dir);
+            const segments = dir.split('/').filter(Boolean);
+            while (segments.length > 1) { segments.pop(); dirs.add(segments.join('/')); }
+            waitUntil(Promise.all([
+                purgePublicFileListCache(url.origin, ...dirs),
+                purgeRandomFileListCache(url.origin, ...dirs),
+            ]));
         }
 
         // 更新索引

@@ -28,7 +28,7 @@ export async function onRequest(context) {
         case 'DELETE': return handleDelete(modifiedRequest, env);
         case 'GET': return handleGet(modifiedRequest, env);
         case 'MOVE': return handleMove(modifiedRequest, env, context);
-        case 'MKCOL': return new Response(null, { status: 201 });
+        case 'MKCOL': return new Response('MKCOL is not supported', { status: 405 });
         default: return new Response('Method Not Allowed', { status: 405 });
     }
 }
@@ -90,7 +90,10 @@ async function checkAuth(request, env) {
 
     const davUser = othersConfig.webDAV.username;
     const davPass = othersConfig.webDAV.password;
-    if (!davUser || !davPass) return null; // No auth required
+    // 启用 WebDAV 但未设置账号或密码时，拒绝所有 DAV 请求（不放行匿名访问）
+    if (!davUser || !davPass) {
+        return new Response('WebDAV credentials are not configured', { status: 403 });
+    }
 
     const authHeader = request.headers.get('Authorization');
     if (!authHeader) {
@@ -105,7 +108,19 @@ async function checkAuth(request, env) {
         return new Response('Malformed Authorization header', { status: 400 });
     }
 
-    const [user, pass] = atob(encoded).split(':');
+    // 密码可能含冒号：只按第一个冒号切分
+    let decoded;
+    try {
+        decoded = atob(encoded);
+    } catch {
+        return new Response('Malformed Authorization header', { status: 400 });
+    }
+    const colonIndex = decoded.indexOf(':');
+    if (colonIndex === -1) {
+        return new Response('Malformed Authorization header', { status: 400 });
+    }
+    const user = decoded.slice(0, colonIndex);
+    const pass = decoded.slice(colonIndex + 1);
     if (user !== davUser || pass !== davPass) {
         return new Response('Invalid credentials', { status: 403 });
     }
@@ -240,11 +255,17 @@ async function handleDelete(request, env) {
             headers: await getApiHeaders(env)
         });
         const result = await response.json();
-        if (result.success) {
+        // 删除接口对文件夹返回 success:true 时仍可能有 failed 列表（部分失败），
+        // 只有全部成功才返回 204，否则如实返回失败
+        const failedFiles = Array.isArray(result.failed) ? result.failed : [];
+        if (result.success && failedFiles.length === 0) {
             return new Response(null, { status: 204 }); // No Content
         } else {
+            const failedMsg = failedFiles.length > 0
+                ? `Deletion partially failed: ${failedFiles.length} file(s) failed`
+                : `Deletion failed: ${result.error || 'API error'}`;
             console.error('Delete API error:', JSON.stringify(result));
-            return new Response(`Deletion failed: ${result.error || 'API error'}`, { status: 500 });
+            return new Response(failedMsg, { status: 500 });
         }
     } catch (error) {
         console.error('Delete operation failed:', error.stack);

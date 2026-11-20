@@ -88,7 +88,9 @@ async function checkUser({ env, request, url, authCodeConfigured, userAuthCode }
  * @param {URL} [options.url] - 请求URL（authCode 提取需要）
  * @param {string|null} [options.requiredPermission] - API Token 所需权限
  * @param {'admin'|'user'|'either'} [options.authScope='either'] - 认证范围
- * @returns {Promise<{authorized: boolean, authType: 'admin'|'user'|null}>}
+ * @returns {Promise<{authorized: boolean, authType: 'admin'|'user'|'token'|null, configError?: boolean}>}
+ *          配置读失败时返回 {authorized:false, authType:null, configError:true}（fail-closed，
+ *          调用方应据此返回 503，而不是用空配置默认放行）
  */
 export async function authenticate({
     env,
@@ -97,8 +99,14 @@ export async function authenticate({
     requiredPermission = null,
     authScope = AUTH_SCOPE.EITHER,
 }) {
-    // 读取安全配置
-    const securityConfig = await fetchSecurityConfig(env);
+    // 读取安全配置：读失败时直接抛错，禁止用空认证默认配置放行（fail-closed）
+    let securityConfig;
+    try {
+        securityConfig = await fetchSecurityConfig(env, { throwOnError: true });
+    } catch (error) {
+        console.error('Failed to fetch security config, denying access:', error);
+        return { authorized: false, authType: null, configError: true };
+    }
     const adminUsername = securityConfig.auth.admin.adminUsername;
     const adminPassword = securityConfig.auth.admin.adminPassword;
     const userAuthCode = securityConfig.auth.user.authCode;
@@ -107,10 +115,11 @@ export async function authenticate({
     const authCodeConfigured = !!(userAuthCode && userAuthCode.trim());
 
     // --- API Token 验证（公共层，所有 scope 通用） ---
+    // Token 只代表其自身权限，不升格为管理员：返回独立的 authType:'token'
     const db = getDatabase(env);
     const tokenResult = await validateApiToken(request, db, requiredPermission);
     if (tokenResult.valid) {
-        return AUTHORIZED('admin');
+        return AUTHORIZED('token');
     }
 
     // --- 会话/凭据验证 ---

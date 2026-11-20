@@ -1,6 +1,9 @@
 import { readIndex } from "../../../utils/indexManager.js";
 import { filterTagsByPrefix } from "../../../utils/tagHelpers.js";
 
+// 单次联想最多扫描的文件数（索引按时间倒序，超出的旧文件标签不参与联想）。
+const MAX_SCAN_FILES = 100000;
+
 /**
  * Tag Autocomplete API
  *
@@ -39,10 +42,13 @@ export async function onRequest(context) {
             });
         }
 
-        // Read from index (only first 1000 files)
+        // 全量扫描索引去重：只看前 1000 个文件时，图库大了以后一些标签搜不出来。
+        // readIndex 本来就会把整份索引读进内存一次，因此一次取全量比分多页反复读更省；
+        // 为防超大图库失控，只扫前 MAX_SCAN_FILES 条（按时间倒序，即最新的优先），
+        // 超出时在响应里标明 truncated。
         const result = await readIndex(context, {
             start: 0,
-            count: 1000,
+            count: -1,
             includeSubdirFiles: true
         });
 
@@ -58,7 +64,8 @@ export async function onRequest(context) {
 
         // Extract unique tags from files
         const allTags = new Set();
-        for (const file of result.files) {
+        const scannedFiles = result.files.slice(0, MAX_SCAN_FILES);
+        for (const file of scannedFiles) {
             if (file.metadata && Array.isArray(file.metadata.Tags)) {
                 file.metadata.Tags.forEach(tag => {
                     if (tag && typeof tag === 'string') {
@@ -81,7 +88,9 @@ export async function onRequest(context) {
             prefix: prefix,
             tags: filteredTags,
             total: filteredTags.length,
-            hasMore: tagsArray.length > filteredTags.length
+            hasMore: tagsArray.length > filteredTags.length,
+            scannedFiles: scannedFiles.length,
+            truncated: result.files.length > MAX_SCAN_FILES
         }), {
             status: 200,
             headers: {

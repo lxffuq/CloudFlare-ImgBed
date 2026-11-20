@@ -14,9 +14,13 @@ export async function onRequest(context) {
         return new Response('Method Not Allowed', { status: 405 });
     }
 
-    // 双重鉴权检查
+    // 双重鉴权检查：includeDisabled=true 会返回被禁用的渠道，需 manage 权限；
+    // 只列出已启用渠道时，任意有效 Token 均可通过（上传流程需要）
     const url = new URL(request.url);
-    const { authorized } = await dualAuthCheck(env, url, request);
+    const includeDisabled = url.searchParams.get('includeDisabled') === 'true';
+    const { authorized } = await dualAuthCheck(env, url, request, {
+        requiredPermission: includeDisabled ? 'manage' : null,
+    });
     if (!authorized) {
         return new Response(JSON.stringify({ error: 'Unauthorized' }), {
             status: 401,
@@ -25,8 +29,6 @@ export async function onRequest(context) {
     }
 
     try {
-        const includeDisabled = url.searchParams.get('includeDisabled') === 'true';
-
         let uploadConfig;
         if (includeDisabled) {
             // 获取所有上传配置（包括禁用的渠道）

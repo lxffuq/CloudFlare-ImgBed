@@ -104,6 +104,35 @@ function stripManagePrefix(key) {
 }
 
 /**
+ * 备份导出前剔除敏感字段，避免 Token 明文 / 密码哈希随备份外泄
+ * - sysConfig@security：删掉各 Token 的 token 全值、管理员密码哈希、用户 authCode
+ * @param {string} settingKey - 移除 manage@ 前缀后的键名
+ * @param {*} value - 解析后的设置值
+ * @returns {*} 脱敏后的设置值
+ */
+function sanitizeExportedSetting(settingKey, value) {
+  if (settingKey !== 'sysConfig@security' || !value || typeof value !== 'object') {
+    return value;
+  }
+  const sanitized = JSON.parse(JSON.stringify(value));
+  if (sanitized.auth?.admin) {
+    delete sanitized.auth.admin.adminPassword;
+  }
+  if (sanitized.auth?.user) {
+    delete sanitized.auth.user.authCode;
+  }
+  const tokens = sanitized.apiTokens?.tokens;
+  if (tokens && typeof tokens === 'object') {
+    for (const tokenId of Object.keys(tokens)) {
+      if (tokens[tokenId] && typeof tokens[tokenId] === 'object') {
+        delete tokens[tokenId].token;
+      }
+    }
+  }
+  return sanitized;
+}
+
+/**
  * 处理 GET 请求 - 读取所有系统设置
  * 
  * @param {Object} context - Cloudflare Workers 上下文
@@ -163,7 +192,7 @@ export async function onRequestGet(context) {
             
             // 使用移除前缀后的键名
             const settingKey = stripManagePrefix(key);
-            settings[settingKey] = parsedValue;
+            settings[settingKey] = sanitizeExportedSetting(settingKey, parsedValue);
           }
         } catch (valueError) {
           // 读取值失败时记录错误但继续处理

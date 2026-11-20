@@ -12,6 +12,12 @@ import { moderateContent, endUpload, getUploadIp, getIPAddress, sanitizeUploadFo
 import { userAuthCheck, UnauthorizedResponse } from '../../utils/auth/userAuth.js';
 import { resolveUploadExpiry } from '../../utils/fileExpiryService.js';
 
+// 与 getUploadUrl.js 的 hfDirectIssuanceKey 保持一致（内联，避免跨模块导入）。
+// commitUpload 只认 getUploadUrl 签发过的 fullId/filePath/渠道/哈希组合。
+function hfDirectIssuanceKey(fullId) {
+    return `hf_direct_upload_${fullId}`;
+}
+
 export async function onRequestPost(context) {
     const { request, env, waitUntil } = context;
     const url = new URL(request.url);
@@ -59,7 +65,9 @@ export async function onRequestPost(context) {
             });
         }
 
-        // 选择渠道
+        // 选择渠道：只认 getUploadUrl 签发记录里的渠道。前端回传的 channelName
+        // 必须与签发记录一致，否则拒绝；不回传时直接用签发记录的渠道，
+        // 两步再也不会选到不同仓库（P1-43）。
         let hfChannel;
         if (channelName) {
             hfChannel = hfSettings.channels.find(c => c.name === channelName);
@@ -81,6 +89,67 @@ export async function onRequestPost(context) {
         if (expiry.error) {
             return createResponse(JSON.stringify({ error: expiry.error }), {
                 status: 400,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+
+        // P1-43：fileSize 必须是正整数，sha256 必须是 64 位 hex
+        if (!Number.isInteger(fileSize) || fileSize <= 0) {
+            return createResponse(JSON.stringify({ error: 'fileSize must be a positive integer' }), {
+                status: 400,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+        if (typeof sha256 !== 'string' || !/^[0-9a-fA-F]{64}$/.test(sha256)) {
+            return createResponse(JSON.stringify({ error: 'sha256 must be a 64-character hex string' }), {
+                status: 400,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+
+        // P0-8：只接受 getUploadUrl 签发过的提交。签发记录不存在（没走
+        // getUploadUrl、已过期、或 fullId 是现编的）直接拒绝；filePath 必须
+        // 与签发的一致，客户端不能再拿任意 fullId/filePath 来覆盖已有文件。
+        const db = getDatabase(env);
+        const issuanceRaw = await db.get(hfDirectIssuanceKey(fullId));
+        if (!issuanceRaw) {
+            return createResponse(JSON.stringify({
+                error: 'Missing or expired direct upload session; call getUploadUrl first'
+            }), {
+                status: 400,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+        let issuance;
+        try {
+            issuance = JSON.parse(issuanceRaw);
+        } catch (e) {
+            return createResponse(JSON.stringify({ error: 'Invalid direct upload session' }), {
+                status: 400,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+        if (issuance.filePath !== filePath || issuance.sha256 !== sha256 || issuance.fileSize !== fileSize) {
+            return createResponse(JSON.stringify({ error: 'Direct upload session mismatch' }), {
+                status: 400,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+        if (channelName && issuance.channelName && channelName !== issuance.channelName) {
+            return createResponse(JSON.stringify({ error: 'channelName does not match the direct upload session' }), {
+                status: 400,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+        const issuedChannel = hfSettings.channels.find(c => c.name === issuance.channelName);
+        if (issuedChannel) {
+            hfChannel = issuedChannel;
+        }
+
+        // db.put 前先 get：目标 fullId 已有记录时拒绝覆盖，防劫持 /file/<id>
+        if ((await db.get(fullId)) !== null) {
+            return createResponse(JSON.stringify({ error: 'File already exists' }), {
+                status: 409,
                 headers: { 'Content-Type': 'application/json' }
             });
         }
@@ -140,8 +209,10 @@ export async function onRequestPost(context) {
         }
 
         // 写入数据库
-        const db = getDatabase(env);
         await db.put(fullId, "", { metadata });
+
+        // 提交成功，签发记录作废（防重放第二次提交覆盖）
+        await db.delete(hfDirectIssuanceKey(fullId)).catch(() => {});
 
         // 结束上传（更新索引等）
         const uploadContext = {

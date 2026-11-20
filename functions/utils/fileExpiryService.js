@@ -240,6 +240,18 @@ export async function cleanupExpiredFiles(context, { now = Date.now(), limit } =
     for (const target of targets) {
         try {
             if (target.record) {
+                // P1-26：删除存储对象前再校验一次“当前记录仍是待删版本”。
+                // 确认时（confirmDue）到删对象之间，用户可能用同一文件 ID
+                // 重新上传；版本变了就跳过，不删新文件的内容对象，下次清理
+                // 再按新记录重新评估。以前只在删记录时校验，对象已被误删。
+                const current = await db.getWithMetadata(target.fileId);
+                if (!isMissingRecord(current) && (
+                    getExpiresAt(current.metadata) !== target.expiresAt ||
+                    current.metadata?.TimeStamp !== target.record.metadata?.TimeStamp
+                )) {
+                    console.warn(`Expired file ${target.fileId} was replaced during cleanup; skipping storage deletion`);
+                    continue;
+                }
                 if (!await deleteStoredFile(env, target.fileId, target.record)) {
                     throw new Error('storage channel reported a failed deletion');
                 }

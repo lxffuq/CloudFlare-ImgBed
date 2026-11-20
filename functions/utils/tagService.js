@@ -43,13 +43,26 @@ export async function applyTagItems(context, items, action = 'add', limits = {})
     const dirs = new Set();
     for (const item of items) {
         try {
-            const record = await db.getWithMetadata(item.fileId);
+            let record = await db.getWithMetadata(item.fileId);
             if (!record?.metadata) throw new APIError('FILE_NOT_FOUND', 'File no longer exists.', 404);
             if (item.sourceIdentity && await fileIdentity(record.metadata) !== item.sourceIdentity) throw new APIError('FILE_CHANGED', 'File changed. Generate suggestions again.', 409);
-            const tags = mergeTags(record.metadata.Tags || [], item.tags, action);
-            const metadata = cleanPersistedMetadata({ ...record.metadata, Tags: tags });
-            const changed = JSON.stringify(record.metadata.Tags || []) !== JSON.stringify(tags);
-            if (context.env.img_url && encoder.encode(JSON.stringify(metadata)).length > 1024) throw new APIError('METADATA_TOO_LARGE', 'File metadata exceeds the KV 1 KB limit. Reduce the selected tags.', 413);
+            // 读-改-写整份元数据无并发保护：两人同时打标签会互相覆盖。
+            // 写前重读一次，若 Tags 已被他人改过就用最新记录重算合并，最多重试 3 次
+            // （只能缩窄竞争窗口，不能彻底消除——KV 没有原子条件写，最后一次仍直接写）。
+            let tags;
+            let metadata;
+            let changed;
+            for (let attempt = 0; ; attempt++) {
+                tags = mergeTags(record.metadata.Tags || [], item.tags, action);
+                metadata = cleanPersistedMetadata({ ...record.metadata, Tags: tags });
+                changed = JSON.stringify(record.metadata.Tags || []) !== JSON.stringify(tags);
+                if (context.env.img_url && encoder.encode(JSON.stringify(metadata)).length > 1024) throw new APIError('METADATA_TOO_LARGE', 'File metadata exceeds the KV 1 KB limit. Reduce the selected tags.', 413);
+                if (!changed || attempt >= 2) break;
+                const fresh = await db.getWithMetadata(item.fileId);
+                if (!fresh?.metadata) throw new APIError('FILE_NOT_FOUND', 'File no longer exists.', 404);
+                if (JSON.stringify(fresh.metadata.Tags || []) === JSON.stringify(record.metadata.Tags || [])) break;
+                record = fresh;
+            }
             if (changed) {
                 await db.put(item.fileId, record.value, { metadata });
                 const dir = metadata.Directory || item.fileId.slice(0, Math.max(0, item.fileId.lastIndexOf('/')));

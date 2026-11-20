@@ -11,6 +11,11 @@ export async function onRequest(context) {
       data, // arbitrary space for passing data between middlewares
     } = context;
     try {
+        // 前端用同站 fetch POST 调本接口；跨站表单 POST 无需 Token 就能借 Cookie 触发，
+        // 因此做同站检查（见 delete/[[path]].js 的说明）：跨站信号拒绝，无信号放行。
+        const forbidden = rejectCrossSiteRequest(request);
+        if (forbidden) return forbidden;
+
         const db = getDatabase(env);
         let list = await db.get("manage@blockipList");
         if (list == null) {
@@ -32,4 +37,24 @@ export async function onRequest(context) {
     } catch (e) {
         return new Response('delete ip from block ip list failed', { status: 500 });
     }
+}
+
+// 同站检查：有跨站信号返回 403 响应，无跨站信号返回 null（见 delete/[[path]].js 的说明）。
+function isCrossSiteRequest(request) {
+    const fetchSite = request.headers.get('Sec-Fetch-Site');
+    if (fetchSite) return fetchSite !== 'same-origin' && fetchSite !== 'same-site' && fetchSite !== 'none';
+    const origin = request.headers.get('Origin');
+    if (origin) {
+        try { return new URL(origin).origin !== new URL(request.url).origin; } catch { return true; }
+    }
+    const referer = request.headers.get('Referer');
+    if (referer) {
+        try { return new URL(referer).origin !== new URL(request.url).origin; } catch { return true; }
+    }
+    return false;
+}
+
+function rejectCrossSiteRequest(request) {
+    if (request.headers.get('Authorization') || !isCrossSiteRequest(request)) return null;
+    return new Response('Cross-site request forbidden', { status: 403 });
 }

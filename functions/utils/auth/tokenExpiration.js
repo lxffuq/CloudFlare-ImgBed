@@ -14,6 +14,10 @@ export function isExpired(expiresAt, now = new Date()) {
     return false;
   }
   const expiresDate = new Date(expiresAt);
+  // 非法日期按已过期处理，避免永不过期
+  if (Number.isNaN(expiresDate.getTime())) {
+    return true;
+  }
   const currentTime = now instanceof Date ? now : new Date(now);
   return currentTime.getTime() > expiresDate.getTime();
 }

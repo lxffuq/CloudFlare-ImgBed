@@ -53,12 +53,12 @@ describe('read and list files', () => {
         assert.equal(page.isIndexedResponse, true);
         assert.deepEqual(page.files.map(file => file.name), ['album/b.png']);
         assert.deepEqual(page.directories, ['album/sub']);
-        assert.equal(page.totalCount, 3);
+        assert.equal(page.totalCount, 2); // P1-21：非递归时总数只计直接文件（album/sub/c.png 不计入）。
         assert.equal(page.directFileCount, 2);
         assert.equal(page.returnedCount, 1);
         const recursive = await list('dir=album&count=-1&recursive=true');
         assert.deepEqual(recursive.files.map(file => file.name), ['album/a.png', 'album/b.png', 'album/sub/c.png']);
-        assert.equal((await list('dir=album&count=-1&sum=true')).sum, 3);
+        assert.equal((await list('dir=album&count=-1&sum=true')).sum, 2); // P1-21：sum 同样只计直接文件。
         assert.deepEqual((await list('dir=album&search=B.PNG')).files.map(file => file.name), ['album/b.png']);
     });
 

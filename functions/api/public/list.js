@@ -87,14 +87,24 @@ async function getPublicFileList(context, url, dir, recursive) {
     }
 
     // 转换文件格式（只保留必要信息）
-    const files = result.files.map(file => ({
-        id: file.id,
-        metadata: {
-            FileType: file.metadata?.FileType,
-            TimeStamp: file.metadata?.TimeStamp,
-            FileSize: file.metadata?.FileSize,
-        }
-    }));
+    // P1-19：已过期的文件不再出现在公开浏览里。ExpiresAt 一起进缓存，
+    // 读缓存时也按它再过滤一次（缓存 24 小时，期间到期的文件同样要消失）。
+    const now = Date.now();
+    const isExpiredRecord = (metadata) => {
+        const expiresAt = Number(metadata?.ExpiresAt);
+        return Number.isFinite(expiresAt) && expiresAt <= now;
+    };
+    const files = result.files
+        .filter(file => !isExpiredRecord(file.metadata))
+        .map(file => ({
+            id: file.id,
+            metadata: {
+                FileType: file.metadata?.FileType,
+                TimeStamp: file.metadata?.TimeStamp,
+                FileSize: file.metadata?.FileSize,
+                ExpiresAt: file.metadata?.ExpiresAt,
+            }
+        }));
 
     const cacheData = {
         files,
@@ -206,6 +216,15 @@ export async function onRequest(context) {
 
         let filteredFiles = cachedData.files;
 
+        // P1-19：缓存里可能还留着建缓存后才到期的文件，读出时再按 ExpiresAt 过滤一次
+        const now = Date.now();
+        filteredFiles = filteredFiles.filter(file => {
+            const expiresAt = Number(file.metadata?.ExpiresAt);
+            return !(Number.isFinite(expiresAt) && expiresAt <= now);
+        });
+        // 过期过滤后的可见总数（无搜索/类型过滤时用它，不用缓存里的旧总数）
+        const visibleTotalCount = filteredFiles.length;
+
         // 搜索过滤
         if (search) {
             filteredFiles = filteredFiles.filter(file => {
@@ -241,7 +260,7 @@ export async function onRequest(context) {
         return new Response(JSON.stringify({
             files: safeFiles,
             directories: filteredDirectories,
-            totalCount: (search || fileType) ? filteredTotalCount : cachedData.totalCount,
+            totalCount: (search || fileType) ? filteredTotalCount : visibleTotalCount,
             returnedCount: safeFiles.length,
             allowedDirs: allowedDirs, // 返回允许的目录列表供前端使用
             fromCache: cachedData.fromCache,

@@ -13,9 +13,18 @@
 import { HuggingFaceAPI } from '../../utils/storage/huggingfaceAPI.js';
 import { resolveFileType } from '../../utils/mimeTypes.js';
 import { fetchUploadConfig } from '../../utils/sysConfig.js';
+import { getDatabase } from '../../utils/databaseAdapter.js';
 import { userAuthCheck, UnauthorizedResponse } from '../../utils/auth/userAuth.js';
-import { buildUniqueFileId, getUploadIp, isBlockedUploadIp, createResponse, checkUploadFormat } from '../uploadTools.js';
+import { buildUniqueFileId, getUploadIp, isBlockedUploadIp, createResponse, checkUploadFormat, selectConsistentChannel, isValidSha256, isPositiveInteger } from '../uploadTools.js';
 import { resolveUploadExpiry } from '../../utils/fileExpiryService.js';
+
+// P0-8：getUploadUrl 签发的直传会话记录键。commitUpload 只认这里签发过的
+// fullId/filePath/渠道/哈希，签发记录 TTL 24 小时（大文件直传可能耗时很久）。
+export const HF_DIRECT_ISSUANCE_TTL_SECONDS = 86400;
+
+export function hfDirectIssuanceKey(fullId) {
+    return `hf_direct_upload_${fullId}`;
+}
 
 export async function onRequestPost(context) {
     const { request, env } = context;
@@ -64,6 +73,20 @@ export async function onRequestPost(context) {
         const uploadConfig = await fetchUploadConfig(env);
         const formatError = checkUploadFormat(fileName, uploadConfig);
         if (formatError) return formatError;
+
+        // P1-43：fileSize 必须是正整数，sha256 必须是 64 位 hex
+        if (!isPositiveInteger(fileSize)) {
+            return createResponse(JSON.stringify({ error: 'fileSize must be a positive integer' }), {
+                status: 400,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+        if (!isValidSha256(sha256)) {
+            return createResponse(JSON.stringify({ error: 'sha256 must be a 64-character hex string' }), {
+                status: 400,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
         const hfSettings = uploadConfig.huggingface;
 
         if (!hfSettings || !hfSettings.channels || hfSettings.channels.length === 0) {
@@ -77,11 +100,17 @@ export async function onRequestPost(context) {
         let hfChannel;
         if (channelName) {
             hfChannel = hfSettings.channels.find(c => c.name === channelName);
+            if (!hfChannel) {
+                return createResponse(JSON.stringify({ error: 'HuggingFace channel not found' }), {
+                    status: 400,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+            }
         }
         if (!hfChannel) {
-            hfChannel = hfSettings.loadBalance?.enabled
-                ? hfSettings.channels[Math.floor(Math.random() * hfSettings.channels.length)]
-                : hfSettings.channels[0];
+            // 不再随机选渠道：按文件哈希确定性选渠道；commitUpload 只认
+            // 下面写入的签发记录里的渠道，两步不可能再选到不同仓库（P1-43）。
+            hfChannel = selectConsistentChannel(hfSettings.channels, `${fileName}:${sha256}`, hfSettings.loadBalance?.enabled);
         }
 
         if (!hfChannel || !hfChannel.token || !hfChannel.repo) {
@@ -108,6 +137,19 @@ export async function onRequestPost(context) {
         const filePath = lastSlashIndex === -1 
             ? `${uniquePrefix}_${fullId}` 
             : `${fullId.substring(0, lastSlashIndex + 1)}${uniquePrefix}_${fullId.substring(lastSlashIndex + 1)}`;
+
+        // P0-8：把这次签发的 fullId/filePath/渠道/哈希写进服务端记录，
+        // commitUpload 只认签发过的组合，客户端再也无法拿任意 fullId 来覆盖已有文件。
+        const db = getDatabase(env);
+        await db.put(hfDirectIssuanceKey(fullId), JSON.stringify({
+            fullId,
+            filePath,
+            channelName: hfChannel.name,
+            sha256,
+            fileSize,
+            uploadIp,
+            createdAt: Date.now(),
+        }), { expirationTtl: HF_DIRECT_ISSUANCE_TTL_SECONDS });
 
         // 获取 LFS 上传信息
         const huggingfaceAPI = new HuggingFaceAPI(hfChannel.token, hfChannel.repo, hfChannel.isPrivate || false);

@@ -48,6 +48,14 @@ export async function createSession(env, authType, username = '') {
         expirationTtl: maxAge,
     });
 
+    // D1 会忽略 expirationTtl：登录时顺手清理已过期的会话，避免永久堆积。
+    // 清理失败不影响本次登录。
+    try {
+        await cleanupExpiredSessions(env);
+    } catch (error) {
+        console.error('Failed to clean up expired sessions:', error);
+    }
+
     const cookieName = COOKIE_NAMES[authType] || 'session';
     const cookie = buildSessionCookie(cookieName, token, maxAge, secure);
     return { token, cookie };
@@ -143,6 +151,57 @@ export async function destroySession(env, request, authType) {
 }
 
 /**
+ * 清理已过期的会话（D1 下 expirationTtl 不生效，靠 expiresAt 字段判断）
+ * 损坏的记录（JSON 解析失败）也会删掉；读失败的记录跳过不删。
+ * @param {Object} env - 环境变量
+ * @returns {Promise<number>} 清理的会话数量
+ */
+export async function cleanupExpiredSessions(env) {
+    const db = getDatabase(env);
+    let cleaned = 0;
+
+    let cursor = undefined;
+    let hasMore = true;
+
+    while (hasMore) {
+        const listOptions = { prefix: SESSION_PREFIX };
+        if (cursor) {
+            listOptions.cursor = cursor;
+        }
+
+        const result = await db.list(listOptions);
+        const keys = result.keys || [];
+
+        for (const key of keys) {
+            let sessionStr;
+            try {
+                sessionStr = await db.get(key.name);
+            } catch {
+                continue; // 读失败：跳过，不删
+            }
+            if (!sessionStr) continue;
+            let session;
+            try {
+                session = JSON.parse(sessionStr);
+            } catch {
+                await db.delete(key.name);
+                cleaned++;
+                continue;
+            }
+            if (typeof session.expiresAt === 'number' && Date.now() > session.expiresAt) {
+                await db.delete(key.name);
+                cleaned++;
+            }
+        }
+
+        cursor = result.cursor;
+        hasMore = !result.list_complete && cursor;
+    }
+
+    return cleaned;
+}
+
+/**
  * 按认证类型批量清除会话
  * @param {Object} env - 环境变量
  * @param {string} authType - 要清除的认证类型 ('admin' | 'user')
@@ -165,16 +224,23 @@ export async function destroySessionsByAuthType(env, authType) {
         const keys = result.keys || [];
 
         for (const key of keys) {
+            let sessionStr;
             try {
-                const sessionStr = await db.get(key.name);
-                if (sessionStr) {
-                    const session = JSON.parse(sessionStr);
-                    if (session.authType === authType) {
-                        await db.delete(key.name);
-                        destroyed++;
-                    }
-                }
+                sessionStr = await db.get(key.name);
             } catch {
+                continue; // 读失败：跳过，不删（瞬时读错不能把有效会话删掉）
+            }
+            if (!sessionStr) continue;
+            let session;
+            try {
+                session = JSON.parse(sessionStr);
+            } catch {
+                // 确认损坏的记录才删
+                await db.delete(key.name);
+                destroyed++;
+                continue;
+            }
+            if (session.authType === authType) {
                 await db.delete(key.name);
                 destroyed++;
             }

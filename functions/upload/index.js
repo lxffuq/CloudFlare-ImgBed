@@ -13,9 +13,10 @@ import { TelegramAPI } from "../utils/storage/telegramAPI";
 import { DiscordAPI } from "../utils/storage/discordAPI";
 import { HuggingFaceAPI } from "../utils/storage/huggingfaceAPI";
 import { WebDAVAPI } from "../utils/storage/webdavAPI";
-import { PutObjectCommand } from "@aws-sdk/client-s3";
+import { PutObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { getDatabase } from '../utils/databaseAdapter.js';
 import { resolveUploadExpiry } from '../utils/fileExpiryService.js';
+import { validateExternalUrl } from '../utils/ssrfGuard.js';
 
 
 export async function onRequest(context) {  // Contents of context object
@@ -143,6 +144,22 @@ async function processFileUpload(context, formdata = null) {
     // 获取文件信息
     const time = new Date().getTime();
     const file = formdata.get('file');
+    // P1-39：取到 file 后立即判空并校验是 File/Blob，缺字段返回 400 而不是
+    // 在 file.name 上抛 TypeError 变成 500。
+    if (!file || typeof file !== 'object' || typeof file.arrayBuffer !== 'function' || typeof file.name !== 'string') {
+        return createResponse('Error: No file provided', { status: 400 });
+    }
+    // P1-44：空文件与超大文件在入口就拒绝。单文件上传走 Worker 请求体，
+    // 上限取 Worker 请求体限制 100MB；Telegram Bot API 本身只收 50MB，
+    // 单独再收紧。S3 流式上传改动风险大，本轮先做大小校验（见汇报）。
+    const SINGLE_UPLOAD_MAX_BYTES = 100 * 1024 * 1024;
+    const channelMaxBytes = uploadChannel === 'TelegramNew' ? 50 * 1024 * 1024 : SINGLE_UPLOAD_MAX_BYTES;
+    if (file.size === 0) {
+        return createResponse('Error: Empty file', { status: 400 });
+    }
+    if (file.size > channelMaxBytes) {
+        return createResponse(`Error: File size exceeds single-upload limit (${Math.floor(channelMaxBytes / 1024 / 1024)}MB), please use chunked upload`, { status: 413 });
+    }
     let fileName = file.name;
     const formatError = checkUploadFormat(fileName, context.uploadConfig);
     if (formatError) return formatError;
@@ -308,6 +325,29 @@ function buildUploadResponse(context, returnLink) {
     return createUploadResponse(context, [result]);
 }
 
+// P1-40/41：写库失败后尽力删掉已落盘的 S3 孤儿对象；删失败也不改变原错误
+async function deleteS3ObjectBestEffort(s3Client, bucketName, key) {
+    try {
+        await s3Client.send(new DeleteObjectCommand({ Bucket: bucketName, Key: key }));
+    } catch (error) {
+        console.warn(`Failed to delete orphan S3 object ${key}:`, error.message);
+    }
+}
+
+// P1-42：尽力删除刚发到 Telegram 的消息（文件信息解析失败时防孤儿消息）
+async function deleteTelegramMessageBestEffort(telegramAPI, chatId, messageId) {
+    if (!messageId || !telegramAPI?.baseURL) return;
+    try {
+        await fetch(`${telegramAPI.baseURL}/deleteMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
+        });
+    } catch (error) {
+        console.warn('Failed to delete Telegram message:', error.message);
+    }
+}
+
 // 上传到Cloudflare R2
 async function uploadFileToCloudflareR2(context, fullId, metadata, returnLink) {
     const { env, waitUntil, uploadConfig, formdata, specifiedChannelName } = context;
@@ -335,10 +375,15 @@ async function uploadFileToCloudflareR2(context, fullId, metadata, returnLink) {
 
     const R2DataBase = env.img_r2;
 
-    // 写入R2数据库
-    await R2DataBase.put(fullId, formdata.get('file'), {
-        httpMetadata: { contentType: metadata.FileType },
-    });
+    // P1-40：R2 put 抛异常不再直接外抛（以前会绕过自动重试直接 500），
+    // 改为返回 500 Response，让 tryRetry 接手换渠道。
+    try {
+        await R2DataBase.put(fullId, formdata.get('file'), {
+            httpMetadata: { contentType: metadata.FileType },
+        });
+    } catch (error) {
+        return createResponse(`Error: Failed to upload to R2 - ${error.message}`, { status: 500 });
+    }
 
     // 更新metadata
     metadata.Channel = "CloudflareR2";
@@ -355,6 +400,8 @@ async function uploadFileToCloudflareR2(context, fullId, metadata, returnLink) {
             metadata: metadata,
         });
     } catch (error) {
+        // P1-40：R2 对象已落盘、写库失败时尽力删掉孤儿对象再报 500
+        await R2DataBase.delete(fullId).catch(() => {});
         return createResponse('Error: Failed to write to database', { status: 500 });
     }
 
@@ -428,6 +475,8 @@ async function uploadFileToS3(context, fullId, metadata, returnLink) {
             try {
                 await db.put(fullId, "", { metadata });
             } catch {
+                // P1-41：第一次写库失败时 S3 对象还没产生可访问记录，直接报 500
+                await deleteS3ObjectBestEffort(s3Client, bucketName, s3FileName);
                 return createResponse("Error: Failed to write to KV database", { status: 500 });
             }
 
@@ -440,6 +489,10 @@ async function uploadFileToS3(context, fullId, metadata, returnLink) {
         try {
             await db.put(fullId, "", { metadata });
         } catch {
+            // P1-41：第二次写库失败时回滚删除第一次的记录，并尽力删 S3 孤儿对象，
+            // 不再出现“报失败但文件能访问”
+            await db.delete(fullId).catch(() => {});
+            await deleteS3ObjectBestEffort(s3Client, bucketName, s3FileName);
             return createResponse("Error: Failed to write to database", { status: 500 });
         }
 
@@ -532,36 +585,59 @@ async function uploadFileToTelegram(context, fullId, metadata, fileExt, fileName
     let res = createResponse('upload error, check your environment params about telegram channel!', { status: 400 });
     try {
         const response = await telegramAPI.sendFile(formdata.get('file'), tgChatId, sendFunction.url, sendFunction.type);
+        // P1-42：getFileInfo 返回 null 未判空会抛 TypeError，被外层改写成
+        // 400（文件其实已发出）。空值时记明确日志、返回 502，并尽力删
+        // 掉刚发的 TG 消息防孤儿。animation 等类型的解析分支在
+        // telegramAPI.js（不在本组文件集合内），未改，见汇报。
         const fileInfo = telegramAPI.getFileInfo(response);
+        if (!fileInfo || !fileInfo.file_id) {
+            console.error('Telegram upload error: getFileInfo returned null');
+            await deleteTelegramMessageBestEffort(telegramAPI, tgChatId, response?.result?.message_id);
+            return createResponse('Error: Failed to get file info from Telegram', { status: 502 });
+        }
         const filePath = await telegramAPI.getFilePath(fileInfo.file_id);
+        if (!filePath) {
+            console.error('Telegram upload error: getFilePath returned null');
+            await deleteTelegramMessageBestEffort(telegramAPI, tgChatId, response?.result?.message_id);
+            return createResponse('Error: Failed to get file path from Telegram', { status: 502 });
+        }
         const id = fileInfo.file_id;
         // 更新FileSize
         metadata.FileSize = (fileInfo.file_size / 1024 / 1024).toFixed(2);
 
-        // 将响应返回给客户端
-        res = buildUploadResponse(context, returnLink);
+        // 更新metadata
+        metadata.Channel = "TelegramNew";
+        metadata.ChannelName = tgChannel.name;
+        metadata.TgFileId = id;
 
-
-        // 图像审查（使用代理域名或官方域名）
-        const moderateDomain = tgProxyUrl ? `https://${tgProxyUrl}` : 'https://api.telegram.org';
-        const moderateUrl = `${moderateDomain}/file/bot${tgBotToken}/${filePath}`;
+        // P0-11/P1-41：先写一条 Label:"pending" 的临时记录（不进索引，
+        // endUpload 只在最终写库成功后才调），审查改用自有域名地址
+        // /file/<id>，不再把带 Bot Token 的 TG 直链发给第三方审查服务。
+        // 最终写库失败时回滚删除临时记录，不再“报失败但文件能访问”。
+        try {
+            await db.put(fullId, "", { metadata: { ...metadata, Label: "pending" } });
+        } catch (error) {
+            return createResponse('Error: Failed to write to KV database', { status: 500 });
+        }
+        const moderateUrl = `https://${url.hostname}/file/${fullId}`;
+        await purgeCDNCache(env, moderateUrl, url);
         metadata.Label = await moderateContent(env, moderateUrl);
 
-        // 更新metadata，写入KV数据库
+        // 写入最终记录
         try {
-            metadata.Channel = "TelegramNew";
-            metadata.ChannelName = tgChannel.name;
-
-            metadata.TgFileId = id;
             await db.put(fullId, "", {
                 metadata: metadata,
             });
         } catch (error) {
-            res = createResponse('Error: Failed to write to KV database', { status: 500 });
+            await db.delete(fullId).catch(() => {});
+            return createResponse('Error: Failed to write to KV database', { status: 500 });
         }
 
         // 结束上传
         waitUntil(endUpload(context, fullId, metadata));
+
+        // 将响应返回给客户端
+        res = buildUploadResponse(context, returnLink);
 
     } catch (error) {
         console.log('Telegram upload error:', error.message);
@@ -584,6 +660,11 @@ async function uploadFileToExternal(context, fullId, metadata, returnLink) {
     const extUrl = formdata.get('url');
     if (extUrl === null || extUrl === undefined) {
         return createResponse('Error: No url provided', { status: 400 });
+    }
+    // P1-30：外链只允许 http(s) 且拒绝内网/保留地址，否则可作 SSRF 跳板
+    const extUrlCheck = validateExternalUrl(extUrl);
+    if (!extUrlCheck.ok) {
+        return createResponse(`Error: ${extUrlCheck.error}`, { status: 400 });
     }
     metadata.ExternalLink = extUrl;
     // 写入KV数据库
@@ -786,6 +867,9 @@ async function uploadFileToHuggingFace(context, fullId, metadata, returnLink) {
         try {
             await db.put(fullId, "", { metadata });
         } catch (error) {
+            // P1-41：第二次写库失败时回滚删除第一次的记录，不再“报失败但文件能访问”
+            //（HF 远端文件本身删不掉，见汇报）
+            await db.delete(fullId).catch(() => {});
             return createResponse('Error: Failed to write to KV database', { status: 500 });
         }
 
@@ -851,6 +935,8 @@ async function uploadFileToWebDAV(context, fullId, metadata, returnLink) {
                 try {
                     await db.put(fullId, "", { metadata });
                 } catch {
+                    // 第一次写库失败：远端文件已传、无记录指向，尽力删掉孤儿文件
+                    await webdavAPI.deleteFile(fullId).catch(() => {});
                     return createResponse('Error: Failed to write to database', { status: 500 });
                 }
 
@@ -863,6 +949,9 @@ async function uploadFileToWebDAV(context, fullId, metadata, returnLink) {
         try {
             await db.put(fullId, "", { metadata });
         } catch {
+            // P1-41：第二次写库失败时回滚删除第一次的记录，并尽力删远端孤儿文件
+            await db.delete(fullId).catch(() => {});
+            await webdavAPI.deleteFile(fullId).catch(() => {});
             return createResponse('Error: Failed to write to database', { status: 500 });
         }
 
@@ -880,6 +969,34 @@ async function uploadFileToWebDAV(context, fullId, metadata, returnLink) {
 async function tryRetry(err, context, uploadChannel, fullId, metadata, fileExt, fileName, fileType, returnLink) {
     const { env, url, formdata } = context;
 
+    // P1-40：各渠道函数统一“返回 Response、不抛错”。这里再包一层 try/catch，
+    // 万一某个渠道函数仍抛异常（如 R2 偶发失败），也只记一条错误、继续换
+    // 下一个渠道，而不是整个重试直接 500。
+    async function callChannel(channel, fn) {
+        try {
+            return await fn();
+        } catch (error) {
+            console.error(`Channel ${channel} threw during retry:`, error.message);
+            return createResponse(`Error: ${channel} failed - ${error.message}`, { status: 500 });
+        }
+    }
+    function dispatch(channel) {
+        if (channel === 'CloudflareR2') {
+            return uploadFileToCloudflareR2(context, fullId, metadata, returnLink);
+        } else if (channel === 'TelegramNew') {
+            return uploadFileToTelegram(context, fullId, metadata, fileExt, fileName, fileType, returnLink);
+        } else if (channel === 'S3') {
+            return uploadFileToS3(context, fullId, metadata, returnLink);
+        } else if (channel === 'HuggingFace') {
+            return uploadFileToHuggingFace(context, fullId, metadata, returnLink);
+        } else if (channel === 'WebDAV') {
+            return uploadFileToWebDAV(context, fullId, metadata, returnLink);
+        } else if (channel === 'Discord') {
+            return uploadFileToDiscord(context, fullId, metadata, returnLink);
+        }
+        return null;
+    }
+
     // 渠道列表（Discord 因为有 10MB 限制，放在最后尝试）
     const channelList = ['CloudflareR2', 'TelegramNew', 'S3', 'HuggingFace', 'WebDAV', 'Discord'];
     const errMessages = {};
@@ -887,20 +1004,7 @@ async function tryRetry(err, context, uploadChannel, fullId, metadata, fileExt, 
 
     // 先用原渠道再试一次（关闭服务端压缩）
     url.searchParams.set('serverCompress', 'false');
-    let retryRes = null;
-    if (uploadChannel === 'CloudflareR2') {
-        retryRes = await uploadFileToCloudflareR2(context, fullId, metadata, returnLink);
-    } else if (uploadChannel === 'TelegramNew') {
-        retryRes = await uploadFileToTelegram(context, fullId, metadata, fileExt, fileName, fileType, returnLink);
-    } else if (uploadChannel === 'S3') {
-        retryRes = await uploadFileToS3(context, fullId, metadata, returnLink);
-    } else if (uploadChannel === 'HuggingFace') {
-        retryRes = await uploadFileToHuggingFace(context, fullId, metadata, returnLink);
-    } else if (uploadChannel === 'WebDAV') {
-        retryRes = await uploadFileToWebDAV(context, fullId, metadata, returnLink);
-    } else if (uploadChannel === 'Discord') {
-        retryRes = await uploadFileToDiscord(context, fullId, metadata, returnLink);
-    }
+    let retryRes = await callChannel(uploadChannel, () => dispatch(uploadChannel));
 
     // 原渠道重试成功，直接返回
     if (retryRes && retryRes.status === 200) {
@@ -912,20 +1016,7 @@ async function tryRetry(err, context, uploadChannel, fullId, metadata, fileExt, 
     // 原渠道重试失败，切换到其他渠道
     for (let i = 0; i < channelList.length; i++) {
         if (channelList[i] !== uploadChannel) {
-            let res = null;
-            if (channelList[i] === 'CloudflareR2') {
-                res = await uploadFileToCloudflareR2(context, fullId, metadata, returnLink);
-            } else if (channelList[i] === 'TelegramNew') {
-                res = await uploadFileToTelegram(context, fullId, metadata, fileExt, fileName, fileType, returnLink);
-            } else if (channelList[i] === 'S3') {
-                res = await uploadFileToS3(context, fullId, metadata, returnLink);
-            } else if (channelList[i] === 'HuggingFace') {
-                res = await uploadFileToHuggingFace(context, fullId, metadata, returnLink);
-            } else if (channelList[i] === 'WebDAV') {
-                res = await uploadFileToWebDAV(context, fullId, metadata, returnLink);
-            } else if (channelList[i] === 'Discord') {
-                res = await uploadFileToDiscord(context, fullId, metadata, returnLink);
-            }
+            const res = await callChannel(channelList[i], () => dispatch(channelList[i]));
 
             if (res && res.status === 200) {
                 return res;

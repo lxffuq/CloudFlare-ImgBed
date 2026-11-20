@@ -10,14 +10,18 @@ import { authenticate, AUTH_SCOPE } from './authCore.js';
  * @param {Object} env - 环境变量
  * @param {URL} url - 请求的URL
  * @param {Request} request - 请求对象
- * @returns {Promise<{authorized: boolean, authType: string|null}>}
+ * @param {Object} [options] - 可选项
+ * @param {string|null} [options.requiredPermission=null] - API Token 调用本端点所需的权限；
+ *        只约束 Token 路径，会话/凭据路径不受影响。不传则任何有效 Token 都可通过（保持旧行为）。
+ * @param {'admin'|'user'|'either'} [options.authScope='either'] - 认证范围
+ * @returns {Promise<{authorized: boolean, authType: string|null, configError?: boolean}>}
  */
-export async function dualAuthCheck(env, url, request) {
+export async function dualAuthCheck(env, url, request, options = {}) {
     return await authenticate({
         env,
         request,
         url,
-        requiredPermission: null,
-        authScope: AUTH_SCOPE.EITHER,
+        requiredPermission: options.requiredPermission ?? null,
+        authScope: options.authScope ?? AUTH_SCOPE.EITHER,
     });
 }

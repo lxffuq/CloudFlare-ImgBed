@@ -131,7 +131,13 @@ export async function getIPAddress(env, ip, securityConfig = null) {
 
 // 处理文件名中的特殊字符
 export function sanitizeFileName(fileName) {
-    fileName = decodeURIComponent(fileName);
+    // 非法 % 序列（如文件名含单独的 %）会使 decodeURIComponent 抛 URIError，
+    // 与 sanitizeUploadFolder 一致：解码失败时用原值继续处理。
+    try {
+        fileName = decodeURIComponent(fileName);
+    } catch (e) {
+        // keep original value
+    }
     fileName = fileName.split('/').pop();
 
     const unsafeCharsRe = /[\\\/:\*\?"'<>\| \(\)\[\]\{\}#%\^`~;@&=\+\$,]/g;
@@ -367,9 +373,15 @@ export async function purgeCDNCache(env, cdnUrl, url, normalizedFolder) {
         return;
     }
 
-    // 清除 api/randomFileList 等API缓存
-    await purgeRandomFileListCache(url.origin, normalizedFolder);
-    await purgePublicFileListCache(url.origin, normalizedFolder);
+    // 清缓存是尽力而为的后台操作：失败（包括配置缺失）绝不能拖垮上传本身，
+    // 调用方（Telegram/S3/HF/WebDAV 的审查前调用）都不再为此单独 try/catch。
+    try {
+        // 清除 api/randomFileList 等API缓存
+        await purgeRandomFileListCache(url.origin, normalizedFolder);
+        await purgePublicFileListCache(url.origin, normalizedFolder);
+    } catch (error) {
+        console.warn('Failed to purge list caches:', error.message);
+    }
 }
 
 // 结束上传：清除缓存，维护索引
@@ -423,6 +435,52 @@ export async function isBlockedUploadIp(env, uploadIp) {
 }
 
 // 构建唯一文件ID
+//
+// P0-9：先查后放会在并发同名上传时撞名覆盖。生成候选 ID 后立即写一条带过期
+// 的占位记录（独立键，不进索引、不干扰列表），下一次生成先查真实记录、再查
+// 占位键，两者都空才算可用。KV/D1 都没有 CAS，这只能把竞态窗口从“整个上传
+// 过程”缩到“查到写占位之间”的毫秒级；占位 TTL 1 小时，与上传会话一致，
+// D1 下 expirationTtl 会被静默丢弃，但占位键只会挡住这一个已用过的 ID，
+// 不影响其它上传。
+export const FILE_ID_RESERVE_TTL_SECONDS = 3600;
+
+export function fileIdReserveKey(fileId) {
+    return `upload_reserve_${fileId}`;
+}
+
+async function reserveFileId(db, fileId) {
+    try {
+        await db.put(fileIdReserveKey(fileId), JSON.stringify({ createdAt: Date.now() }), {
+            expirationTtl: FILE_ID_RESERVE_TTL_SECONDS,
+        });
+    } catch (error) {
+        console.warn(`Failed to reserve file ID ${fileId}:`, error);
+    }
+    return fileId;
+}
+
+async function isFileIdFree(db, fileId) {
+    return (await db.get(fileId)) === null && (await db.get(fileIdReserveKey(fileId))) === null;
+}
+
+// 校验本次上传是否仍持有该文件 ID 的占位（合并写库前用；占位过期需重新生成 ID）
+export async function isFileIdReserved(db, fileId) {
+    try {
+        return (await db.get(fileIdReserveKey(fileId))) !== null;
+    } catch (error) {
+        return false;
+    }
+}
+
+// SHA256 / 正整数校验（HuggingFace 直传两端共用）
+export function isValidSha256(value) {
+    return typeof value === 'string' && /^[0-9a-fA-F]{64}$/.test(value);
+}
+
+export function isPositiveInteger(value) {
+    return Number.isInteger(value) && value > 0;
+}
+
 export async function buildUniqueFileId(context, fileName, fileType = 'application/octet-stream') {
     const { env, url } = context;
     const db = getDatabase(env);
@@ -450,8 +508,8 @@ export async function buildUniqueFileId(context, fileName, fileType = 'applicati
         while (true) {
             const shortId = generateShortId(8);
             const testFullId = normalizedFolder ? `${normalizedFolder}/${shortId}.${fileExt}` : `${shortId}.${fileExt}`;
-            if (await db.get(testFullId) === null) {
-                return testFullId;
+            if (await isFileIdFree(db, testFullId)) {
+                return reserveFileId(db, testFullId);
             }
         }
     } else {
@@ -459,8 +517,8 @@ export async function buildUniqueFileId(context, fileName, fileType = 'applicati
     }
 
     // 检查基础ID是否已存在
-    if (await db.get(baseId) === null) {
-        return baseId;
+    if (await isFileIdFree(db, baseId)) {
+        return reserveFileId(db, baseId);
     }
 
     // 如果已存在，在文件名后面加上递增编号
@@ -489,8 +547,8 @@ export async function buildUniqueFileId(context, fileName, fileType = 'applicati
         }
 
         // 检查新ID是否已存在
-        if (await db.get(duplicateId) === null) {
-            return duplicateId;
+        if (await isFileIdFree(db, duplicateId)) {
+            return reserveFileId(db, duplicateId);
         }
 
         counter++;

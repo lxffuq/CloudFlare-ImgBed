@@ -21,9 +21,12 @@ async function errorHandling(context) {
   try {
     return withDefaultCacheControl(await context.next());
   } catch (err) {
-    return new Response(`${err.message}\n${err.stack}`, {
+    // 只把堆栈写服务端日志，不回显给客户端
+    console.error('Manage API error:', err && err.stack ? err.stack : err);
+    return new Response(JSON.stringify({ error: 'Internal Server Error' }), {
       status: 500,
       headers: {
+        'Content-Type': 'application/json',
         'Cache-Control': DEFAULT_MANAGE_CACHE_CONTROL,
       },
     });
@@ -86,6 +89,17 @@ async function authentication(context) {
     requiredPermission,
     authScope: AUTH_SCOPE.ADMIN,
   });
+
+  // 安全配置读失败：fail-closed，返回 503 而不是 401（避免被当成“未登录”重试登录）
+  if (result.configError) {
+    return new Response(JSON.stringify({ error: 'Security config unavailable' }), {
+      status: 503,
+      headers: {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-store',
+      },
+    });
+  }
 
   if (!result.authorized) {
     return UnauthorizedException('You need to login');

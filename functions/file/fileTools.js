@@ -161,6 +161,15 @@ export async function returnWithCheck(context, imgRecord) {
 
     const record = imgRecord;
     if (record.metadata === null) {
+        // P2-51：无元数据的历史 Telegraph 文件以前直接放行，白名单模式下
+        // 也应按未加白处理（返回占位图）；管理员预览仍放行。
+        if (isAdminPreview) {
+            context.fileAccess.cacheControl = FILE_CACHE_CONTROL.PRIVATE;
+            return response;
+        }
+        if (whiteListMode) {
+            return await returnWhiteListImg(url);
+        }
         context.fileAccess.cacheControl = isAdminPreview ? FILE_CACHE_CONTROL.PRIVATE : FILE_CACHE_CONTROL.PUBLIC;
         return response;
     }

@@ -8,6 +8,15 @@ class D1Database {
     }
 }
 
+/**
+ * 转义 LIKE 通配符：前缀里的 _、%、\ 按字面匹配
+ * @param {string} value - 前缀
+ * @returns {string} 转义后的 LIKE 模式片段
+ */
+function escapeLikePattern(value) {
+    return String(value).replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+}
+
 // ==================== 文件操作 ====================
 
 /**
@@ -96,8 +105,8 @@ D1Database.prototype.listFiles = function(options) {
     var params = [];
     
     if (prefix) {
-        query += ' WHERE id LIKE ?';
-        params.push(prefix + '%');
+        query += ' WHERE id LIKE ? ESCAPE \'\\\'';
+        params.push(escapeLikePattern(prefix) + '%');
     }
     
     if (cursor) {
@@ -243,8 +252,8 @@ D1Database.prototype.listSettings = function(options) {
     var params = [];
 
     if (prefix) {
-        query += ' WHERE key LIKE ?';
-        params.push(prefix + '%');
+        query += ' WHERE key LIKE ? ESCAPE \'\\\'';
+        params.push(escapeLikePattern(prefix) + '%');
     }
 
     // 与 listFiles 一致返回 cursor，否则超过 limit 的键（如大量会话）会让后面的设置永远读不到
@@ -394,6 +403,20 @@ D1Database.prototype.extractMetadataFields = function(metadata) {
  */
 D1Database.prototype.put = function(key, value, options) {
     options = options || {};
+
+    // 会话记录：D1 没有 KV 的 expirationTtl，过期时间必须落在记录里，
+    // 否则会话永不过期。调用方没写 expiresAt 时按 expirationTtl 补一个。
+    if (key.startsWith('manage@session@') && options.expirationTtl) {
+        try {
+            var sessionValue = JSON.parse(value);
+            if (sessionValue && typeof sessionValue === 'object' && !sessionValue.expiresAt) {
+                sessionValue.expiresAt = Date.now() + options.expirationTtl * 1000;
+                value = JSON.stringify(sessionValue);
+            }
+        } catch (e) {
+            // 值不是 JSON 时原样写入，由调用方处理
+        }
+    }
 
     if (key.startsWith('manage@index@operation_')) {
         var operationId = key.replace('manage@index@operation_', '');

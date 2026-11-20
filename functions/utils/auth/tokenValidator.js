@@ -42,54 +42,12 @@ export async function validateApiToken(request, db, requiredPermission) {
     }
 
     // 检查权限，如果不需要特定权限（requiredPermission为null），则只要token有效就通过
-    if (requiredPermission !== null && !tokenData.permissions.includes(requiredPermission)) {
-        return { valid: false, error: `缺少${requiredPermission}权限` };
+    // permissions 损坏（非数组）时直接拒绝，避免 .includes 抛错或字符串子串匹配
+    if (requiredPermission !== null) {
+        if (!Array.isArray(tokenData.permissions) || !tokenData.permissions.includes(requiredPermission)) {
+            return { valid: false, error: `缺少${requiredPermission}权限` };
+        }
     }
 
     return { valid: true };
-}
-
-/**
- * 从请求中提取Token信息
- * @param {Request} request - 请求对象
- * @param {KVNamespace} kv - KV存储
- * @returns {Promise<object|null>} Token信息或null
- */
-export async function getTokenInfo(request, kv) {
-    const authHeader = request.headers.get('Authorization');
-    
-    if (!authHeader) {
-        return null;
-    }
-
-    let token;
-    
-    if (authHeader.startsWith('Bearer ')) {
-        token = authHeader.substring(7);
-    } else {
-        token = authHeader;
-    }
-
-    if (!token) {
-        return null;
-    }
-
-    // 从KV中获取Token信息
-    const settingsStr = await kv.get('manage@sysConfig@security');
-    const settings = settingsStr ? JSON.parse(settingsStr) : {};
-    const tokens = settings.apiTokens?.tokens || {};
-    
-    // 查找匹配的token
-    for (const tokenId in tokens) {
-        if (tokens[tokenId].token === token) {
-            const t = tokens[tokenId];
-            return {
-                ...t,
-                expiresAt: t.expiresAt ?? null,
-                autoDelete: t.autoDelete ?? false
-            };
-        }
-    }
-    
-    return null;
 }

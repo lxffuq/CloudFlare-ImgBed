@@ -8,6 +8,85 @@ import { getDatabase, checkDatabaseConfig } from '../utils/databaseAdapter.js';
 import { fetchPageConfig } from '../utils/sysConfig.js';
 import { resolveFileType } from '../utils/mimeTypes.js';
 
+// 分块数上限（P1-33/34，与合并侧一致）；前端分块大小与之配套：
+// Discord 9MB、其它渠道 16MB，200 块即单文件上限约 1.8–3.2GB。
+export const MAX_TOTAL_CHUNKS = 200;
+export const CHUNK_SIZE_BY_CHANNEL = { discord: 9437184, default: 16777216 };
+const SESSION_TTL_SECONDS = 3600;
+
+// P0-10：校验分块会话归属。会话里存的上传 IP 与当前请求 IP 一致才放行；
+// 任一为空（无法确认，如测试环境或 IP 头缺失）时不拦截，避免把正常上传误杀。
+// 注意：移动网络切换 IP 会导致同一次上传后续分块被拦，属已知取舍，见汇报。
+export function checkSessionOwnership(sessionInfo, request) {
+    const sessionIp = sessionInfo?.uploadIp;
+    if (!sessionIp) return true;
+    const requestIp = getUploadIp(request);
+    if (!requestIp) return true;
+    return sessionIp === requestIp;
+}
+
+function chunkKeyFor(uploadId, chunkIndex) {
+    return `chunk_${uploadId}_${chunkIndex.toString().padStart(3, '0')}`;
+}
+
+// P1-48：分块 SHA256（前端暂不传每块哈希时跳过；初始化传了 chunkHashes 才校验）
+export async function sha256Hex(data) {
+    const digest = await crypto.subtle.digest('SHA-256', data);
+    return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// P1-32：带版本守卫的分块状态写入。晚到的上传结果（已超时/失败的旧尝试）
+// 不得覆盖更新的状态：只有记录仍是本次尝试（uploadStartTime 相同）且处于
+// uploading/retrying 时才写。
+async function writeChunkStatusIfCurrent(db, chunkKey, attemptStartTime, metadata, value, usingD1) {
+    const current = await db.getWithMetadata(chunkKey, { type: 'arrayBuffer' });
+    if (!current || !current.metadata) return false;
+    if (current.metadata.uploadStartTime !== attemptStartTime) return false;
+    if (current.metadata.status !== 'uploading' && current.metadata.status !== 'retrying') return false;
+    await db.put(chunkKey, value, { metadata, expirationTtl: SESSION_TTL_SECONDS });
+    return true;
+}
+
+function isValidChunkIndex(value, totalChunks) {
+    return Number.isInteger(value) && value >= 0 && value < totalChunks;
+}
+
+// 读 multipart 记录（JSON 解析失败返回 null）
+async function readMultipartInfo(db, multipartKey) {
+    try {
+        const raw = await db.get(multipartKey);
+        return raw ? JSON.parse(raw) : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+// 等一个已创建好的 multipart 记录（带 uploadId 才算）；超时返回 null。
+// P1-37：非 0 分块不再等 60 秒，默认只等 5 秒，等不到就失败由客户端重传。
+async function waitForMultipartInfo(db, multipartKey, maxWaitMs = 5000) {
+    const deadline = Date.now() + maxWaitMs;
+    while (Date.now() < deadline) {
+        const info = await readMultipartInfo(db, multipartKey);
+        if (info?.uploadId && info.key) return info;
+        await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    return await readMultipartInfo(db, multipartKey).then(info => (info?.uploadId && info.key ? info : null));
+}
+
+function parseChunkHashes(raw, totalChunks) {
+    if (raw === null || raw === undefined || raw === '') return null;
+    try {
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed) || parsed.length !== totalChunks) return { error: 'chunkHashes must be an array matching totalChunks' };
+        if (parsed.some(hash => typeof hash !== 'string' || !/^[0-9a-fA-F]{64}$/.test(hash))) {
+            return { error: 'chunkHashes must be 64-character hex strings' };
+        }
+        return { hashes: parsed };
+    } catch (e) {
+        return { error: 'chunkHashes must be valid JSON' };
+    }
+}
+
 // 初始化分块上传
 export async function initializeChunkedUpload(context) {
     const { request, env, url } = context;
@@ -19,10 +98,30 @@ export async function initializeChunkedUpload(context) {
 
         const originalFileName = formdata.get('originalFileName');
         const originalFileType = resolveFileType(originalFileName, formdata.get('originalFileType'));
-        const totalChunks = parseInt(formdata.get('totalChunks'));
+        // P1-33/34：totalChunks 必须是 1–200 的整数；NaN/负数/小数/超限直接 400。
+        const totalChunks = Number(formdata.get('totalChunks'));
 
-        if (!originalFileName || !originalFileType || !totalChunks) {
+        if (!originalFileName || !originalFileType || !Number.isInteger(totalChunks) || totalChunks < 1 || totalChunks > MAX_TOTAL_CHUNKS) {
             return createResponse('Error: Missing initialization parameters', { status: 400 });
+        }
+
+        // P1-34/48：fileSize 可选（前端目前不传）；传了就校验：正整数、
+        // 不超过“分块数×本渠道分块大小”，且按本渠道分块大小算出的块数必须等于 totalChunks。
+        // P1-48：chunkHashes 可选（前端目前不传每块哈希）；传了就校验格式并存入会话供合并核对。
+        const uploadChannelForSize = url.searchParams.get('uploadChannel') || 'telegram';
+        const chunkSizeForChannel = CHUNK_SIZE_BY_CHANNEL[uploadChannelForSize] || CHUNK_SIZE_BY_CHANNEL.default;
+        const rawFileSize = formdata.get('fileSize');
+        let fileSize = null;
+        if (rawFileSize !== null && rawFileSize !== undefined && rawFileSize !== '') {
+            fileSize = Number(rawFileSize);
+            if (!Number.isInteger(fileSize) || fileSize <= 0 || fileSize > MAX_TOTAL_CHUNKS * chunkSizeForChannel ||
+                Math.ceil(fileSize / chunkSizeForChannel) !== totalChunks) {
+                return createResponse('Error: Invalid fileSize for totalChunks', { status: 400 });
+            }
+        }
+        const chunkHashesResult = parseChunkHashes(formdata.get('chunkHashes'), totalChunks);
+        if (chunkHashesResult?.error) {
+            return createResponse(`Error: ${chunkHashesResult.error}`, { status: 400 });
         }
 
         const formatError = checkUploadFormat(originalFileName, context.uploadConfig);
@@ -51,6 +150,8 @@ export async function initializeChunkedUpload(context) {
             originalFileName,
             originalFileType,
             totalChunks,
+            fileSize,
+            chunkHashes: chunkHashesResult?.hashes || null,
             uploadChannel,
             channelName,
             uploadIp,
@@ -98,13 +199,16 @@ export async function handleChunkUpload(context) {
 
     try {
         const chunk = formdata.get('file');
-        const chunkIndex = parseInt(formdata.get('chunkIndex'));
-        const totalChunks = parseInt(formdata.get('totalChunks'));
+        // P1-33：严格解析，NaN/负数/越界/小数直接 400（parseInt('abc') 得 NaN
+        // 旧代码只判 ===null，根本拦不住）。
+        const chunkIndex = Number(formdata.get('chunkIndex'));
+        const totalChunks = Number(formdata.get('totalChunks'));
         const uploadId = formdata.get('uploadId');
         const originalFileName = formdata.get('originalFileName');
         const originalFileType = resolveFileType(originalFileName, formdata.get('originalFileType'));
 
-        if (!chunk || chunkIndex === null || !totalChunks || !uploadId || !originalFileName || !originalFileType) {
+        if (!chunk || !Number.isInteger(totalChunks) || totalChunks < 1 || totalChunks > MAX_TOTAL_CHUNKS ||
+            !isValidChunkIndex(chunkIndex, totalChunks) || !uploadId || !originalFileName || !originalFileType) {
             return createResponse('Error: Missing chunk upload parameters', { status: 400 });
         }
 
@@ -116,6 +220,11 @@ export async function handleChunkUpload(context) {
         }
 
         const sessionInfo = JSON.parse(sessionData);
+
+        // P0-10：分块上传校验会话归属
+        if (!checkSessionOwnership(sessionInfo, request)) {
+            return createResponse('Error: Upload session belongs to another client', { status: 403 });
+        }
 
         // 验证会话信息
         if (sessionInfo.originalFileName !== originalFileName ||
@@ -131,21 +240,48 @@ export async function handleChunkUpload(context) {
             return createResponse('Error: Upload session expired', { status: 410 });
         }
 
-        // 获取上传渠道
-        const uploadChannel = url.searchParams.get('uploadChannel') || sessionInfo.uploadChannel || 'telegram';
+        // P1-35：渠道与渠道名以初始化会话为准，中途换渠道直接 400。
+        // 前端每次请求都带同一套参数（见汇报），不会误伤正常上传。
+        const requestedChannel = url.searchParams.get('uploadChannel');
+        if (requestedChannel && requestedChannel !== sessionInfo.uploadChannel) {
+            return createResponse('Error: uploadChannel does not match the initialized session', { status: 400 });
+        }
+        const uploadChannel = sessionInfo.uploadChannel || requestedChannel || 'telegram';
         if (uploadChannel === 'webdav') {
             return createResponse('Error: WebDAV channel does not support chunked uploads. Please use non-chunked upload within your Cloudflare request body limit.', { status: 400 });
         }
-        // 获取指定的渠道名称
-        const channelName = url.searchParams.get('channelName') || sessionInfo.channelName || '';
+        const requestedChannelName = url.searchParams.get('channelName');
+        if (requestedChannelName && sessionInfo.channelName && requestedChannelName !== sessionInfo.channelName) {
+            return createResponse('Error: channelName does not match the initialized session', { status: 400 });
+        }
+        // 会话建时没指定渠道名、首个分块带了的，把它锁定进会话，后续分块以此为准。
+        const channelName = sessionInfo.channelName || requestedChannelName || '';
+        if (!sessionInfo.channelName && requestedChannelName) {
+            sessionInfo.channelName = requestedChannelName;
+            await db.put(sessionKey, JSON.stringify(sessionInfo), { expirationTtl: SESSION_TTL_SECONDS }).catch(() => {});
+        }
 
         // 将渠道名称存入 context
         context.specifiedChannelName = channelName;
 
         // 立即创建分块记录，标记为"uploading"状态
-        const chunkKey = `chunk_${uploadId}_${chunkIndex.toString().padStart(3, '0')}`;
+        const chunkKey = chunkKeyFor(uploadId, chunkIndex);
         const chunkData = await chunk.arrayBuffer();
         const uploadStartTime = Date.now();
+
+        // P1-48：初始化传了每块哈希的，在这里核对本块字节；不符直接 400，
+        // 不让坏块入库（前端目前不传哈希，此分支默认跳过）。
+        if (sessionInfo.chunkHashes?.[chunkIndex]) {
+            const actualHash = await sha256Hex(chunkData);
+            if (actualHash !== sessionInfo.chunkHashes[chunkIndex].toLowerCase()) {
+                return createResponse(JSON.stringify({
+                    error: `Chunk ${chunkIndex} hash mismatch`,
+                    chunkIndex,
+                    uploadId,
+                }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+            }
+        }
+
         const initialChunkMetadata = {
             uploadId,
             chunkIndex,
@@ -153,10 +289,12 @@ export async function handleChunkUpload(context) {
             originalFileName,
             originalFileType,
             chunkSize: chunkData.byteLength,
+            chunkSha256: sessionInfo.chunkHashes?.[chunkIndex] || null,
             uploadTime: uploadStartTime,
             uploadStartTime: uploadStartTime,
             status: 'uploading',
             uploadChannel,
+            channelName,
             timeoutThreshold: uploadStartTime + 60000 // 1分钟超时阈值
         };
 
@@ -168,7 +306,29 @@ export async function handleChunkUpload(context) {
         });
 
         // 同步上传分块到存储端，添加超时保护
-        await uploadChunkToStorageWithTimeout(context, chunkIndex, totalChunks, uploadId, originalFileName, originalFileType, uploadChannel, usingD1 ? chunkData : undefined);
+        const storageOutcome = await uploadChunkToStorageWithTimeout(context, chunkIndex, totalChunks, uploadId, originalFileName, originalFileType, uploadChannel, usingD1 ? chunkData : undefined, uploadStartTime);
+
+        // P1-31/32：分块接口不再永远返回成功。存储失败/超时时返回 500 并带
+        // chunkIndex；前端对单块失败会重试最多 3 次（已核查，见汇报），
+        // 因此返回 500 不会破坏现有流程，只会让失败可定位、可重试。
+        // D1 下失败分块的字节没有留存，错误里写明需客户端重传该分块。
+        const finalRecord = await db.getWithMetadata(chunkKey);
+        const finalStatus = finalRecord?.metadata?.status;
+        if (!storageOutcome?.success || finalStatus !== 'completed') {
+            const detail = finalRecord?.metadata?.error || storageOutcome?.error || 'Chunk upload failed';
+            return createResponse(JSON.stringify({
+                success: false,
+                error: usingD1
+                    ? `${detail} (chunk ${chunkIndex} data was not retained, please re-upload this chunk)`
+                    : detail,
+                chunkIndex,
+                uploadId,
+                retryable: true,
+            }), {
+                status: 500,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
 
         return createResponse(JSON.stringify({
             success: true,
@@ -192,6 +352,24 @@ export async function handleCleanupRequest(context, uploadId, totalChunks) {
             return createResponse(JSON.stringify({
                 error: 'Missing uploadId parameter'
             }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+        }
+
+        // P0-10：清理先验会话归属。会话不存在直接拒绝（以前任何人拿着
+        // uploadId 就能删掉别人的在途分块）；IP 与会话里的上传 IP 不一致
+        // 也拒绝。前端清理是“尽力而为”（失败只记日志），正常取消上传
+        // 仍由同一浏览器发起，不会被误伤。
+        const { request, env } = context;
+        const db = getDatabase(env);
+        const sessionData = await db.get(`upload_session_${uploadId}`);
+        if (!sessionData) {
+            return createResponse(JSON.stringify({
+                error: 'Invalid or expired upload session'
+            }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+        }
+        if (!checkSessionOwnership(JSON.parse(sessionData), request)) {
+            return createResponse(JSON.stringify({
+                error: 'Upload session belongs to another client'
+            }), { status: 403, headers: { 'Content-Type': 'application/json' } });
         }
 
         // 强制清理所有相关数据
@@ -218,10 +396,15 @@ export async function handleCleanupRequest(context, uploadId, totalChunks) {
 /* ======= 单个分块上传到不同渠道的存储端 ======= */
 
 // 带超时保护的异步上传分块到存储端
-async function uploadChunkToStorageWithTimeout(context, chunkIndex, totalChunks, uploadId, originalFileName, originalFileType, uploadChannel, chunkData) {
+// 返回 {success, error?, timedOut?}，调用方据此决定分块接口返回 200 还是 500。
+// 超时后不再放任后台上传的结果覆盖状态：超时标记带本次尝试的 uploadStartTime
+// 做版本守卫，晚到的成功结果写不进已超时/失败的记录（见 writeChunkStatusIfCurrent）。
+// 注意：Telegram/Discord 的 sendFile 不接受取消信号，超时只能做到“不等它、
+// 不认它的晚到结果”，无法真正中断已发出的上游请求。
+async function uploadChunkToStorageWithTimeout(context, chunkIndex, totalChunks, uploadId, originalFileName, originalFileType, uploadChannel, chunkData, uploadStartTime) {
     const { env } = context;
     const db = getDatabase(env);
-    const chunkKey = `chunk_${uploadId}_${chunkIndex.toString().padStart(3, '0')}`;
+    const chunkKey = chunkKeyFor(uploadId, chunkIndex);
     const UPLOAD_TIMEOUT = 180000; // 3分钟超时
 
     try {
@@ -231,15 +414,16 @@ async function uploadChunkToStorageWithTimeout(context, chunkIndex, totalChunks,
         });
 
         // 执行实际上传
-        const uploadPromise = uploadChunkToStorage(context, chunkIndex, totalChunks, uploadId, originalFileName, originalFileType, uploadChannel, chunkData);
+        const uploadPromise = uploadChunkToStorage(context, chunkIndex, totalChunks, uploadId, originalFileName, originalFileType, uploadChannel, chunkData, uploadStartTime);
 
         // 竞速执行
         await Promise.race([uploadPromise, timeoutPromise]);
+        return { success: true };
 
     } catch (error) {
         console.error(`Chunk ${chunkIndex} upload failed or timed out:`, error);
 
-        // 超时或失败时，更新状态为超时/失败
+        // 超时或失败时，更新状态为超时/失败（带版本守卫：只改本次尝试的记录）
         try {
             const { usingD1 } = checkDatabaseConfig(env);
             const chunkRecord = await db.getWithMetadata(chunkKey, { type: 'arrayBuffer' });
@@ -254,23 +438,21 @@ async function uploadChunkToStorageWithTimeout(context, chunkIndex, totalChunks,
                 };
 
                 // 保留原始数据以便重试（D1模式下不保存二进制数据，避免SQLITE_TOOBIG）
-                await db.put(chunkKey, usingD1 ? '' : chunkRecord.value, {
-                    metadata: errorMetadata,
-                    expirationTtl: 3600
-                });
+                await writeChunkStatusIfCurrent(db, chunkKey, uploadStartTime, errorMetadata, usingD1 ? '' : chunkRecord.value, usingD1);
             }
         } catch (metaError) {
             console.error('Failed to save timeout/error metadata:', metaError);
         }
+        return { success: false, error: error.message, timedOut: error.message === 'Upload timeout' };
     }
 }
 
 // 异步上传分块到存储端，失败自动重试
-async function uploadChunkToStorage(context, chunkIndex, totalChunks, uploadId, originalFileName, originalFileType, uploadChannel, chunkData) {
+async function uploadChunkToStorage(context, chunkIndex, totalChunks, uploadId, originalFileName, originalFileType, uploadChannel, chunkData, uploadStartTime) {
     const { env } = context;
     const db = getDatabase(env);
 
-    const chunkKey = `chunk_${uploadId}_${chunkIndex.toString().padStart(3, '0')}`;
+    const chunkKey = chunkKeyFor(uploadId, chunkIndex);
 
     const MAX_RETRIES = 3;
 
@@ -307,7 +489,9 @@ async function uploadChunkToStorage(context, chunkIndex, totalChunks, uploadId, 
             }
 
             if (uploadResult && uploadResult.success) {
-                // 上传成功，更新状态并保存上传信息
+                // 上传成功，更新状态并保存上传信息（带版本守卫：若本块已被
+                // 标记超时/失败，晚到的成功结果不再覆盖，调用方会返回 500
+                // 让客户端重传该分块）
                 const updatedMetadata = {
                     ...chunkMetadata,
                     status: 'completed',
@@ -316,10 +500,7 @@ async function uploadChunkToStorage(context, chunkIndex, totalChunks, uploadId, 
                 };
 
                 // 只保存metadata，不保存原始数据，设置过期时间
-                await db.put(chunkKey, '', {
-                    metadata: updatedMetadata,
-                    expirationTtl: 3600 // 1小时过期
-                });
+                await writeChunkStatusIfCurrent(db, chunkKey, uploadStartTime, updatedMetadata, '', checkDatabaseConfig(env).usingD1);
 
                 console.log(`Chunk ${chunkIndex} uploaded successfully to ${uploadChannel}`);
 
@@ -335,10 +516,7 @@ async function uploadChunkToStorage(context, chunkIndex, totalChunks, uploadId, 
 
                 // 保留原始数据以便重试（D1模式下不保存二进制数据，避免SQLITE_TOOBIG）
                 const { usingD1: isD1 } = checkDatabaseConfig(env);
-                await db.put(chunkKey, isD1 ? '' : chunkData, {
-                    metadata: failedMetadata,
-                    expirationTtl: 3600 // 1小时过期
-                });
+                await writeChunkStatusIfCurrent(db, chunkKey, uploadStartTime, failedMetadata, isD1 ? '' : chunkData, isD1);
 
                 console.warn(`Chunk ${chunkIndex} upload failed: ${failedMetadata.error}`);
             }
@@ -360,10 +538,7 @@ async function uploadChunkToStorage(context, chunkIndex, totalChunks, uploadId, 
                 };
 
                 // D1模式下不保存二进制数据，避免SQLITE_TOOBIG
-                await db.put(chunkKey, isD1 ? '' : chunkRecord.value, {
-                    metadata: errorMetadata,
-                    expirationTtl: 3600 // 1小时过期
-                });
+                await writeChunkStatusIfCurrent(db, chunkKey, uploadStartTime, errorMetadata, isD1 ? '' : chunkRecord.value, isD1);
             }
         } catch (metaError) {
             console.error('Failed to save error metadata:', metaError);
@@ -387,44 +562,57 @@ async function uploadSingleChunkToR2Multipart(context, chunkData, chunkIndex, to
 
         let finalFileId;
 
-        // 如果是第一个分块，生成并保存 finalFileId
-        if (chunkIndex === 0) {
-            finalFileId = await buildUniqueFileId(context, originalFileName, originalFileType);
-
-            const multipartUpload = await R2DataBase.createMultipartUpload(finalFileId, {
-                httpMetadata: { contentType: originalFileType },
-            });
-            const multipartInfo = {
-                uploadId: multipartUpload.uploadId,
-                key: finalFileId
-            };
-
-            // 保存multipart info
-            await db.put(multipartKey, JSON.stringify(multipartInfo), {
-                expirationTtl: 3600 // 1小时过期
-            });
+        // P1-38：chunk0 先读 multipart 记录，已存在直接复用，不再新建覆盖。
+        // 并发重发的 chunk0 用 creating 占位互斥：看到新鲜的 creating 占位
+        // 时等它一会儿（等创建完成的记录），过期了才自己创建。
+        const existingMultipart = await readMultipartInfo(db, multipartKey);
+        if (existingMultipart?.uploadId && existingMultipart.key) {
+            finalFileId = existingMultipart.key;
         } else {
-            // 其他分块需要等待第一个分块完成multipart upload初始化
-            let multipartInfoData = null;
-            let retryCount = 0;
-            const maxRetries = 30; // 最多等待60秒
-
-            while (!multipartInfoData && retryCount < maxRetries) {
-                multipartInfoData = await db.get(multipartKey);
-                if (!multipartInfoData) {
-                    // 等待2秒后重试
-                    await new Promise(resolve => setTimeout(resolve, 2000));
-                    retryCount++;
-                    console.log(`R2 chunk ${chunkIndex} waiting for multipart initialization... (${retryCount}/${maxRetries})`);
+            if (existingMultipart?.creating && Date.now() - existingMultipart.createdAt < 30000) {
+                const waited = await waitForMultipartInfo(db, multipartKey, 5000);
+                if (waited?.uploadId && waited.key) {
+                    finalFileId = waited.key;
                 }
             }
+            if (!finalFileId) {
+                // 如果是第一个分块，生成并保存 finalFileId
+                if (chunkIndex === 0) {
+                    finalFileId = await buildUniqueFileId(context, originalFileName, originalFileType);
 
-            if (!multipartInfoData) {
-                return { success: false, error: 'Multipart upload not initialized after waiting' };
+                    await db.put(multipartKey, JSON.stringify({ creating: true, createdAt: Date.now() }), {
+                        expirationTtl: 3600
+                    });
+                    let multipartUpload;
+                    try {
+                        multipartUpload = await R2DataBase.createMultipartUpload(finalFileId, {
+                            httpMetadata: { contentType: originalFileType },
+                        });
+                    } catch (error) {
+                        // 创建失败时删掉 creating 占位，否则重试的 chunk0 会
+                        // 对着新鲜占位白等 5 秒（占位只防并发重建，不代表创建成功）
+                        await db.delete(multipartKey).catch(() => {});
+                        throw error;
+                    }
+                    const multipartInfo = {
+                        uploadId: multipartUpload.uploadId,
+                        key: finalFileId
+                    };
+
+                    // 保存multipart info
+                    await db.put(multipartKey, JSON.stringify(multipartInfo), {
+                        expirationTtl: 3600 // 1小时过期
+                    });
+                } else {
+                    // P1-37：其它分块只等很短时间（初始化时 multipart 应已由
+                    // chunk0 建好；等不到就失败、由客户端重传该分块，不再等 60 秒）。
+                    const waited = await waitForMultipartInfo(db, multipartKey, 5000);
+                    if (!waited?.uploadId) {
+                        return { success: false, error: 'Multipart upload not initialized after waiting' };
+                    }
+                    finalFileId = waited.key;
+                }
             }
-
-            const multipartInfo = JSON.parse(multipartInfoData);
-            finalFileId = multipartInfo.key;
         }
 
         // 获取multipart info
@@ -494,47 +682,57 @@ async function uploadSingleChunkToS3Multipart(context, chunkData, chunkIndex, to
 
         let finalFileId;
 
-        // 如果是第一个分块，生成并保存 finalFileId
-        if (chunkIndex === 0) {
-            finalFileId = await buildUniqueFileId(context, originalFileName, originalFileType);
-
-            const createResponse = await s3Client.send(new CreateMultipartUploadCommand({
-                Bucket: bucketName,
-                Key: finalFileId,
-                ContentType: originalFileType || 'application/octet-stream'
-            }));
-
-            const multipartInfo = {
-                uploadId: createResponse.UploadId,
-                key: finalFileId
-            };
-
-            // 保存multipart info
-            await db.put(multipartKey, JSON.stringify(multipartInfo), {
-                expirationTtl: 3600 // 1小时过期
-            });
+        // P1-38/37：与 R2 同款——chunk0 先读记录复用、creating 占位防并发
+        // 重建；非 0 分块只等 5 秒，等不到就失败由客户端重传。
+        const existingMultipart = await readMultipartInfo(db, multipartKey);
+        if (existingMultipart?.uploadId && existingMultipart.key) {
+            finalFileId = existingMultipart.key;
         } else {
-            // 其他分块需要等待第一个分块完成multipart upload初始化
-            let multipartInfoData = null;
-            let retryCount = 0;
-            const maxRetries = 30; // 最多等待60秒
-
-            while (!multipartInfoData && retryCount < maxRetries) {
-                multipartInfoData = await db.get(multipartKey);
-                if (!multipartInfoData) {
-                    // 等待2秒后重试
-                    await new Promise(resolve => setTimeout(resolve, 2000));
-                    retryCount++;
-                    console.log(`S3 chunk ${chunkIndex} waiting for multipart initialization... (${retryCount}/${maxRetries})`);
+            if (existingMultipart?.creating && Date.now() - existingMultipart.createdAt < 30000) {
+                const waited = await waitForMultipartInfo(db, multipartKey, 5000);
+                if (waited?.uploadId && waited.key) {
+                    finalFileId = waited.key;
                 }
             }
+            if (!finalFileId) {
+                // 如果是第一个分块，生成并保存 finalFileId
+                if (chunkIndex === 0) {
+                    finalFileId = await buildUniqueFileId(context, originalFileName, originalFileType);
 
-            if (!multipartInfoData) {
-                return { success: false, error: 'Multipart upload not initialized after waiting' };
+                    await db.put(multipartKey, JSON.stringify({ creating: true, createdAt: Date.now() }), {
+                        expirationTtl: 3600
+                    });
+                    let createResponse;
+                    try {
+                        createResponse = await s3Client.send(new CreateMultipartUploadCommand({
+                            Bucket: bucketName,
+                            Key: finalFileId,
+                            ContentType: originalFileType || 'application/octet-stream'
+                        }));
+                    } catch (error) {
+                        // 创建失败时删掉 creating 占位，否则重试的 chunk0 会
+                        // 对着新鲜占位白等 5 秒（占位只防并发重建，不代表创建成功）
+                        await db.delete(multipartKey).catch(() => {});
+                        throw error;
+                    }
+
+                    const multipartInfo = {
+                        uploadId: createResponse.UploadId,
+                        key: finalFileId
+                    };
+
+                    // 保存multipart info
+                    await db.put(multipartKey, JSON.stringify(multipartInfo), {
+                        expirationTtl: 3600 // 1小时过期
+                    });
+                } else {
+                    const waited = await waitForMultipartInfo(db, multipartKey, 5000);
+                    if (!waited?.uploadId) {
+                        return { success: false, error: 'Multipart upload not initialized after waiting' };
+                    }
+                    finalFileId = waited.key;
+                }
             }
-
-            const multipartInfo = JSON.parse(multipartInfoData);
-            finalFileId = multipartInfo.key;
         }
 
         // 获取multipart info
@@ -785,31 +983,31 @@ export async function retryFailedChunks(context, failedChunks, uploadChannel, op
         const batch = chunksToRetry.slice(i, i + batchSize);
         console.log(`Processing batch ${Math.floor(i / batchSize) + 1}: chunks ${batch.map(c => c.index).join(', ')}`);
 
-        // 创建并发控制的重试任务
-        const retryTasks = batch.map(async (chunk) => {
-            return retrySingleChunk(context, chunk, uploadChannel, maxRetries, retryTimeout);
-        });
-
-        // 限制并发数量
-        const batchResults = [];
-        for (let j = 0; j < retryTasks.length; j += maxConcurrency) {
-            const concurrentTasks = retryTasks.slice(j, j + maxConcurrency);
-            const concurrentResults = await Promise.allSettled(concurrentTasks);
-
-            for (const result of concurrentResults) {
-                if (result.status === 'fulfilled') {
-                    batchResults.push(result.value);
-                } else {
-                    console.error('Retry task failed:', result.reason);
-                    batchResults.push({
-                        success: false,
-                        chunk: null,
-                        error: result.reason?.message || 'Task failed',
-                        reason: 'task_error'
-                    });
+        // 真正的并发控制：worker 池一次只启动 maxConcurrency 路，
+        // 每路完成后再取下一块。原来 batch.map(async...) 会在创建 Promise 的
+        // 瞬间全部开始执行，后面的 slice+allSettled 只是分批“等”，并不限流。
+        const batchResults = new Array(batch.length);
+        let nextIndex = 0;
+        const workers = Array.from(
+            { length: Math.min(maxConcurrency, batch.length) },
+            async () => {
+                while (nextIndex < batch.length) {
+                    const slot = nextIndex++;
+                    try {
+                        batchResults[slot] = await retrySingleChunk(context, batch[slot], uploadChannel, maxRetries, retryTimeout);
+                    } catch (error) {
+                        console.error('Retry task failed:', error);
+                        batchResults[slot] = {
+                            success: false,
+                            chunk: null,
+                            error: error?.message || 'Task failed',
+                            reason: 'task_error'
+                        };
+                    }
                 }
             }
-        }
+        );
+        await Promise.all(workers);
 
         results.push(...batchResults);
 
@@ -1080,6 +1278,7 @@ export async function checkChunkUploadStatuses(env, uploadId, totalChunks) {
                     error: chunkRecord.metadata.error,
                     hasData: hasData,
                     chunkSize: chunkRecord.metadata.chunkSize,
+                    chunkSha256: chunkRecord.metadata.chunkSha256,
                     uploadTime: chunkRecord.metadata.uploadTime,
                     uploadStartTime: chunkRecord.metadata.uploadStartTime,
                     timeoutThreshold: chunkRecord.metadata.timeoutThreshold,

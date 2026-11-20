@@ -15,6 +15,11 @@ export async function onRequest(context) {
     // 组装 CDN URL
     const url = new URL(request.url);
 
+    // 前端是预编译 bundle，仍用 GET 调加白接口，因此不禁 GET，改为同站检查
+    // （见 delete/[[path]].js 的说明）：跨站信号拒绝，无信号放行。
+    const forbidden = rejectCrossSiteRequest(request);
+    if (forbidden) return forbidden;
+
     if (params.path) {
       params.path = String(params.path).split(',').join('/');
     }
@@ -26,6 +31,14 @@ export async function onRequest(context) {
     //read the metadata
     const db = getDatabase(env);
     const value = await db.getWithMetadata(params.path);
+
+    // 记录不存在时直接 404，不再对空记录写 ListType 导致 500 崩溃。
+    if (!value || !value.metadata) {
+      return new Response(JSON.stringify({ success: false, error: 'File not found' }), {
+        status: 404,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
 
     //change the metadata
     value.metadata.ListType = "White"
@@ -45,4 +58,27 @@ export async function onRequest(context) {
     waitUntil(addFileToIndex(context, params.path, metadata));
 
     return new Response(info);
+}
+
+// 同站检查：有跨站信号返回 403 响应，无跨站信号返回 null（见 delete/[[path]].js 的说明）。
+function isCrossSiteRequest(request) {
+    const fetchSite = request.headers.get('Sec-Fetch-Site');
+    if (fetchSite) return fetchSite !== 'same-origin' && fetchSite !== 'same-site' && fetchSite !== 'none';
+    const origin = request.headers.get('Origin');
+    if (origin) {
+        try { return new URL(origin).origin !== new URL(request.url).origin; } catch { return true; }
+    }
+    const referer = request.headers.get('Referer');
+    if (referer) {
+        try { return new URL(referer).origin !== new URL(request.url).origin; } catch { return true; }
+    }
+    return false;
+}
+
+function rejectCrossSiteRequest(request) {
+    if (request.headers.get('Authorization') || !isCrossSiteRequest(request)) return null;
+    return new Response(JSON.stringify({ success: false, error: 'Cross-site request forbidden' }), {
+        status: 403,
+        headers: { 'Content-Type': 'application/json' },
+    });
 }

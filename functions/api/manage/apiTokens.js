@@ -1,6 +1,44 @@
 import { getDatabase } from '../../utils/databaseAdapter.js';
 import { filterAutoDeleteTokens } from '../../utils/auth/tokenExpiration.js';
 
+// Token 权限白名单：创建/更新时只允许这些值
+export const VALID_TOKEN_PERMISSIONS = ['list', 'upload', 'delete', 'manage'];
+
+/**
+ * 校验 Token 的 permissions / expiresAt，返回错误信息，无错返回 null
+ * @param {*} permissions - 必须是白名单内的字符串数组（可为空数组）
+ * @param {*} expiresAt - 必须是 null 或合法 ISO 日期字符串
+ */
+export function validateTokenFields(permissions, expiresAt) {
+    if (!Array.isArray(permissions) || permissions.some(p => typeof p !== 'string' || !VALID_TOKEN_PERMISSIONS.includes(p))) {
+        return 'permissions 必须是白名单权限数组（list/upload/delete/manage）';
+    }
+    if (expiresAt !== null && expiresAt !== undefined) {
+        if (typeof expiresAt !== 'string' || Number.isNaN(Date.parse(expiresAt))) {
+            return 'expiresAt 必须是合法 ISO 日期或 null';
+        }
+    }
+    return null;
+}
+
+function badRequestResponse(message) {
+    return new Response(JSON.stringify({ error: message }), {
+        status: 400,
+        headers: {
+            'content-type': 'application/json',
+        },
+    });
+}
+
+function notFoundResponse(result) {
+    return new Response(JSON.stringify(result), {
+        status: 404,
+        headers: {
+            'content-type': 'application/json',
+        },
+    });
+}
+
 export async function onRequest(context) {
     // API Token管理，支持创建、删除、列出Token
     const {
@@ -36,6 +74,11 @@ export async function onRequest(context) {
             })
         }
 
+        const fieldError = validateTokenFields(permissions, expiresAt);
+        if (fieldError) {
+            return badRequestResponse(fieldError);
+        }
+
         const token = await createApiToken(db, name, permissions, owner, expiresAt, autoDelete)
         return new Response(JSON.stringify(token), {
             headers: {
@@ -58,6 +101,9 @@ export async function onRequest(context) {
         }
 
         const result = await deleteApiToken(db, tokenId)
+        if (result.error) {
+            return notFoundResponse(result);
+        }
         return new Response(JSON.stringify(result), {
             headers: {
                 'content-type': 'application/json',
@@ -79,7 +125,15 @@ export async function onRequest(context) {
             })
         }
 
+        const fieldError = validateTokenFields(permissions, expiresAt);
+        if (fieldError) {
+            return badRequestResponse(fieldError);
+        }
+
         const result = await updateApiToken(db, tokenId, permissions, expiresAt, autoDelete)
+        if (result.error) {
+            return notFoundResponse(result);
+        }
         return new Response(JSON.stringify(result), {
             headers: {
                 'content-type': 'application/json',
@@ -134,7 +188,7 @@ async function getApiTokens(db) {
         permissions: t.permissions,
         createdAt: t.createdAt,
         updatedAt: t.updatedAt,
-        token: t.token.substr(0, 15) + '...', // 只显示前15位
+        token: typeof t.token === 'string' && t.token ? t.token.substr(0, 15) + '...' : '', // 缺 token 字段时显示空串，不整体 500
         expiresAt: t.expiresAt,
         autoDelete: t.autoDelete
     }))
@@ -144,6 +198,10 @@ async function getApiTokens(db) {
 
 // 创建新的API Token
 export async function createApiToken(db, name, permissions, owner, expiresAt = null, autoDelete = false, type = 'user') {
+    const fieldError = validateTokenFields(permissions, expiresAt);
+    if (fieldError) {
+        throw new Error(fieldError);
+    }
     const settingsStr = await db.get('manage@sysConfig@security')
     const settings = settingsStr ? JSON.parse(settingsStr) : {}
     
@@ -205,6 +263,10 @@ export async function deleteApiToken(db, tokenId) {
 
 // 更新API Token
 async function updateApiToken(db, tokenId, permissions, expiresAt = null, autoDelete = false) {
+    const fieldError = validateTokenFields(permissions, expiresAt);
+    if (fieldError) {
+        throw new Error(fieldError);
+    }
     const settingsStr = await db.get('manage@sysConfig@security')
     const settings = settingsStr ? JSON.parse(settingsStr) : {}
     

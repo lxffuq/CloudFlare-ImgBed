@@ -1,32 +1,39 @@
 import { fetchOthersConfig } from "./sysConfig";
 
-let othersConfig = {};
-let cfZoneId = "";
-let cfEmail = "";
-let cfApiKey = "";
-
+/**
+ * 清除 Cloudflare CDN 缓存
+ * @param {Object} env - 环境变量
+ * @param {string} cdnUrl - 要清除缓存的 URL
+ * @returns {Promise<boolean>} true=已清除或无需清除（未配置），false=清除失败（调用方可据此处理）
+ */
 export async function purgeCFCache(env, cdnUrl) {
     try {
-        // 读取其他设置
-        othersConfig = await fetchOthersConfig(env);
-        cfZoneId = othersConfig.cloudflareApiToken.CF_ZONE_ID;
-        cfEmail = othersConfig.cloudflareApiToken.CF_EMAIL;
-        cfApiKey = othersConfig.cloudflareApiToken.CF_API_KEY;
+        // 读取其他设置（局部变量，避免并发请求互相覆盖）
+        const othersConfig = await fetchOthersConfig(env);
+        const cfZoneId = othersConfig.cloudflareApiToken.CF_ZONE_ID;
+        const cfEmail = othersConfig.cloudflareApiToken.CF_EMAIL;
+        const cfApiKey = othersConfig.cloudflareApiToken.CF_API_KEY;
 
         // 如果没有配置Cloudflare API，跳过缓存清除
         if (!cfZoneId || !cfEmail || !cfApiKey) {
-            return;
+            return true;
         }
 
-        // 清除CDN缓存
+        // 清除CDN缓存：用 JSON.stringify 组装 body，避免 URL 含引号时拼出非法 JSON
         const options = {
             method: 'POST',
             headers: {'Content-Type': 'application/json', 'X-Auth-Email': `${cfEmail}`, 'X-Auth-Key': `${cfApiKey}`},
-            body: `{"files":["${ cdnUrl }"]}`
+            body: JSON.stringify({ files: [cdnUrl] })
         };
-        await fetch(`https://api.cloudflare.com/client/v4/zones/${ cfZoneId }/purge_cache`, options);
+        const response = await fetch(`https://api.cloudflare.com/client/v4/zones/${ cfZoneId }/purge_cache`, options);
+        if (!response.ok) {
+            console.error('Failed to purge CF cache: Cloudflare API returned', response.status);
+            return false;
+        }
+        return true;
     } catch (error) {
         console.error('Failed to purge CF cache:', error.message || error);
+        return false;
     }
 }
 

@@ -138,8 +138,8 @@ export async function verifyPassword(inputPassword, storedPassword) {
         const expectedHash = await hashPasswordSHA256(inputPassword, salt);
         return timingSafeEqual(expectedHash, storedPassword);
     } else {
-        // 存储的是明文密码，直接比对（向后兼容）
-        return inputPassword === storedPassword;
+        // 存储的是明文密码，同样走恒定时间比对（向后兼容）
+        return timingSafeEqual(inputPassword, storedPassword);
     }
 }
 

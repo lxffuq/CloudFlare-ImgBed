@@ -746,6 +746,21 @@ async function handleR2File(context, fileId, encodedFileName, fileType) {
                 const start = parseInt(matches[1]);
                 const end = matches[2] ? parseInt(matches[2]) : undefined;
 
+                // P2-52：Range 越界返回 416 而不是 500。先用 head 取对象大小
+                // 校验范围（R2 绑定支持 head；没有 head 方法的旧实现跳过校验
+                // 走原逻辑）。注意与分片路径的 416 行为保持一致。
+                if (typeof R2DataBase.head === 'function') {
+                    const head = await R2DataBase.head(fileId);
+                    const size = head?.size;
+                    const rangeEnd = end !== undefined ? end : (typeof size === 'number' ? size - 1 : undefined);
+                    if (typeof size === 'number' && (start >= size || (rangeEnd !== undefined && (rangeEnd >= size || start > rangeEnd)))) {
+                        return new Response('Range Not Satisfiable', {
+                            status: 416,
+                            headers: { 'Content-Range': `bytes */${size}` },
+                        });
+                    }
+                }
+
                 const rangeOptions = {
                     range: {
                         offset: start
@@ -920,13 +935,23 @@ async function handleS3FileViaAPI(context, metadata, encodedFileName, fileType) 
         }
 
         // 返回响应，支持流式传输
-        const statusCode = range ? 206 : 200; // Range请求返回206 Partial Content
+        // P1-22：透传 S3 实际返回的状态码。Range 越界时 S3 返回 416，
+        // 以前这里写死 206；只有 S3 真返回 206 时才写 206。
+        const statusCode = response.$metadata?.httpStatusCode || response.status || (range ? 206 : 200);
         return new Response(response.Body, {
             status: statusCode,
             headers
         });
 
     } catch (error) {
+        // S3 的 Range 越界以异常形式返回（InvalidRange / 416），映射为 416
+        const httpStatus = error?.$metadata?.httpStatusCode;
+        if (httpStatus === 416 || error?.name === 'InvalidRange') {
+            return new Response('Range Not Satisfiable', {
+                status: 416,
+                headers: { 'Content-Range': 'bytes */*' },
+            });
+        }
         return new Response(`Error: Failed to fetch from S3 - ${error.message}`, { status: 500 });
     }
 }

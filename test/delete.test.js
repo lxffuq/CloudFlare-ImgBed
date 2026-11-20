@@ -126,7 +126,7 @@ describe('delete files', () => {
         const response = await route.onRequest(ctx);
         assert.equal(response.status, 200);
         const body = await response.json();
-        assert.equal(body.success, true); // Folder traversal completed; per-file failures are reported separately.
+        assert.equal(body.success, false); // P1-23：部分失败时 success 为 false，与批量删除一致；失败明细见 failed/details。
         assert.deepEqual(body.deleted, ids.slice(0, 2));
         assert.deepEqual(body.failed, [ids[2]]);
         assert.deepEqual(body.missing, [ids[1]]);

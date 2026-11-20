@@ -3,6 +3,7 @@ import {
     getIndexInfo, getIndexStorageStats
 } from '../../utils/indexManager.js';
 import { getDatabase } from '../../utils/databaseAdapter.js';
+import { authenticate, AUTH_SCOPE } from '../../utils/auth/authCore.js';
 import { createMetadataViewContext, serializeFileRecordForManagement } from '../../utils/metadata/metadataView.js';
 import { maybeCleanupExpiredFiles } from '../../utils/fileExpiryService.js';
 
@@ -68,6 +69,28 @@ export async function onRequest(context) {
     }
 
     try {
+        // 重建索引、合并操作、清空操作队列会改写索引或丢弃未合并的操作，
+        // 中间件对 /api/manage/list 只要求 list 权限，仅 list 权限的 Token 也能调到这里，
+        // 因此这三个动作再核一次 manage 权限；其余 list 动作保持 list 权限。
+        // 这三个动作同时是 GET 可触发的状态变更，做同站检查防 CSRF
+        // （见 delete/[[path]].js 的说明；服务端内调会转发原请求头，通过检查）。
+        if (action === 'rebuild' || action === 'merge-operations' || action === 'delete-operations') {
+            const forbidden = rejectCrossSiteRequest(request);
+            if (forbidden) return forbidden;
+            const manageAuth = await authenticate({
+                env: context.env,
+                request,
+                requiredPermission: 'manage',
+                authScope: AUTH_SCOPE.ADMIN,
+            });
+            if (!manageAuth.authorized) {
+                return new Response('You need to login', {
+                    status: 401,
+                    headers: { 'Content-Type': 'text/plain;charset=UTF-8', ...corsHeaders },
+                });
+            }
+        }
+
         // 特殊操作：重建索引
         if (action === 'rebuild') {
             waitUntil(rebuildIndex(context, (processed) => {
@@ -160,9 +183,23 @@ export async function onRequest(context) {
             includeSubdirFiles: recursive,
         });
 
-        // 索引读取失败，直接从 KV 中获取所有文件记录
+        // 索引读取失败，直接从 KV 中获取所有文件记录；
+        // 兜底分支同样应用搜索、筛选与分页，不再静默返回未过滤的全部数据。
         if (!result.success) {
-            const dbRecords = await getAllFileRecords(context.env, dir);
+            const dbRecords = await getAllFileRecords(context.env, dir, {
+                search,
+                channel: channelArray,
+                listType: listTypeArray,
+                accessStatus: accessStatusArray,
+                label: labelArray,
+                fileType: fileTypeArray,
+                channelName: channelNameArray,
+                includeTags: includeTagsArray,
+                excludeTags: excludeTagsArray,
+                start,
+                count,
+                includeSubdirFiles: recursive,
+            });
 
             return new Response(JSON.stringify({
                 files: dbRecords.files,
@@ -211,7 +248,21 @@ export async function onRequest(context) {
     }
 }
 
-async function getAllFileRecords(env, dir) {
+async function getAllFileRecords(env, dir, filters = {}) {
+    const {
+        search = '',
+        channel = [],
+        listType = [],
+        accessStatus = [],
+        label = [],
+        fileType = [],
+        channelName = [],
+        includeTags = [],
+        excludeTags = [],
+        start = 0,
+        count = 50,
+        includeSubdirFiles = false,
+    } = filters;
     const allRecords = [];
     let cursor = null;
 
@@ -254,26 +305,39 @@ async function getAllFileRecords(env, dir) {
             await new Promise(resolve => setTimeout(resolve, 10));
         }
 
+        // 与 readIndex 同一套筛选语义（搜索、渠道、黑白名单、访问状态、审查结果、
+        // 文件类型、渠道名称、标签），避免兜底分支静默返回未过滤数据。
+        const filteredRecords = allRecords.filter(item => matchesListFilters(item, {
+            search, channel, listType, accessStatus, label, fileType, channelName, includeTags, excludeTags,
+        }));
+
         // 提取目录信息
         const directories = new Set();
-        const filteredRecords = [];
-        allRecords.forEach(item => {
+        const directFiles = [];
+        filteredRecords.forEach(item => {
             const subDir = item.name.substring(dir.length);
             const firstSlashIndex = subDir.indexOf('/');
             if (firstSlashIndex !== -1) {
                 directories.add(dir + subDir.substring(0, firstSlashIndex));
             } else {
-                filteredRecords.push(item);
+                directFiles.push(item);
             }
         });
 
+        // 非递归时只返回直接文件，总数也只计直接文件，与索引分支一致。
+        const visibleFiles = includeSubdirFiles ? filteredRecords : directFiles;
+        const totalCount = visibleFiles.length;
+        const pagedFiles = count === -1
+            ? visibleFiles.slice(Math.max(0, start))
+            : visibleFiles.slice(Math.max(0, start), Math.max(0, start) + Math.max(1, count));
+
         return {
-            files: filteredRecords,
+            files: pagedFiles,
             directories: Array.from(directories),
-            totalCount: allRecords.length,
-            directFileCount: filteredRecords.length,
+            totalCount,
+            directFileCount: directFiles.length,
             directFolderCount: directories.size,
-            returnedCount: filteredRecords.length
+            returnedCount: pagedFiles.length
         };
 
     } catch (error) {
@@ -288,4 +352,96 @@ async function getAllFileRecords(env, dir) {
             error: error.message
         };
     }
+}
+
+// 与 readIndex 相同的列表筛选谓词（供索引不可用的 KV 兜底分支复用）。
+function matchesListFilters(item, filters) {
+    const metadata = item.metadata || {};
+    const {
+        search = '', channel = [], listType = [], accessStatus = [],
+        label = [], fileType = [], channelName = [],
+        includeTags = [], excludeTags = [],
+    } = filters;
+
+    if (channel.length > 0 && !channel.some(ch => metadata.Channel?.toLowerCase() === ch.toLowerCase())) {
+        return false;
+    }
+
+    if (listType.length > 0) {
+        const fileListType = metadata.ListType;
+        if (!listType.some(lt => lt === 'None'
+            ? !fileListType || fileListType === '' || fileListType === 'None'
+            : fileListType === lt)) return false;
+    }
+
+    if (accessStatus.length > 0) {
+        const isBlocked = metadata.ListType === 'Block' || (metadata.Label === 'adult' && metadata.ListType !== 'White');
+        if (!accessStatus.some(status => status === 'normal' ? !isBlocked : status === 'blocked' ? isBlocked : false)) return false;
+    }
+
+    if (label.length > 0) {
+        const fileLabel = metadata.Label;
+        if (!label.some(lbl => lbl === 'normal'
+            ? !fileLabel || fileLabel === '' || fileLabel === 'None' || fileLabel === 'everyone'
+            : lbl === 'teen' ? fileLabel === 'teen'
+            : lbl === 'adult' ? fileLabel === 'adult' : false)) return false;
+    }
+
+    if (fileType.length > 0) {
+        const type = (metadata.FileType || '').toLowerCase();
+        const category = type.startsWith('image/') ? 'image'
+            : type.startsWith('video/') ? 'video'
+            : type.startsWith('audio/') ? 'audio' : 'other';
+        if (!fileType.includes(category)) return false;
+    }
+
+    if (channelName.length > 0) {
+        const fileChannel = metadata.Channel;
+        const fileChannelName = metadata.ChannelName;
+        if (!channelName.some(filterValue => {
+            if (filterValue.includes(':')) {
+                const [type, name] = filterValue.split(':', 2);
+                return fileChannel === type && fileChannelName === name;
+            }
+            return fileChannelName === filterValue;
+        })) return false;
+    }
+
+    if (includeTags.length > 0 || excludeTags.length > 0) {
+        const fileTags = (metadata.Tags || []).map(t => t.toLowerCase());
+        if (includeTags.length > 0 && !includeTags.every(tag => fileTags.includes(tag.toLowerCase()))) return false;
+        if (excludeTags.length > 0 && excludeTags.some(tag => fileTags.includes(tag.toLowerCase()))) return false;
+    }
+
+    if (search) {
+        const searchLower = search.toLowerCase();
+        if (!metadata.FileName?.toLowerCase().includes(searchLower) && !item.name.toLowerCase().includes(searchLower)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// 同站检查：有跨站信号返回 403 响应，无跨站信号返回 null（见 delete/[[path]].js 的说明）。
+function isCrossSiteRequest(request) {
+    const fetchSite = request.headers.get('Sec-Fetch-Site');
+    if (fetchSite) return fetchSite !== 'same-origin' && fetchSite !== 'same-site' && fetchSite !== 'none';
+    const origin = request.headers.get('Origin');
+    if (origin) {
+        try { return new URL(origin).origin !== new URL(request.url).origin; } catch { return true; }
+    }
+    const referer = request.headers.get('Referer');
+    if (referer) {
+        try { return new URL(referer).origin !== new URL(request.url).origin; } catch { return true; }
+    }
+    return false;
+}
+
+function rejectCrossSiteRequest(request) {
+    if (request.headers.get('Authorization') || !isCrossSiteRequest(request)) return null;
+    return new Response(JSON.stringify({ success: false, error: 'Cross-site request forbidden' }), {
+        status: 403,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+    });
 }

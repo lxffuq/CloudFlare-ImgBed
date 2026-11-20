@@ -93,6 +93,14 @@ export async function onRequest(context) {
     // 调用randomFileList接口，读取KV数据库中的所有记录
     let allRecords = await getRandomFileList(context, requestUrl, dir);
 
+    // P1-19：已过期的文件不再进入随机图。ExpiresAt 随缓存记录一起保存，
+    // 这里按它过滤，缓存期内到期的文件同样会被挡掉。
+    const now = Date.now();
+    allRecords = allRecords.filter(item => {
+        const expiresAt = Number(item.ExpiresAt);
+        return !(Number.isFinite(expiresAt) && expiresAt <= now);
+    });
+
     // 筛选出符合fileType要求的记录。FileType 缺失或为通用类型时按扩展名兜底，
     // 兼容历史上被记成 application/octet-stream 的图片。
     allRecords = allRecords.filter(item => matchesFileType(item.FileType, item.name, fileType));
@@ -122,7 +130,9 @@ export async function onRequest(context) {
     }
 
     // 自适应模式降级：过滤后无匹配图片时，降级到全部图片
-    if (isAutoMode && orientation && allRecords.length === 0) {
+    // P2-62：手动指定方向时也一样回落——无宽高信息的图片以前会被全部滤掉
+    // 且无降级，手动模式同样回落到不过滤的结果。
+    if (orientation && allRecords.length === 0) {
         allRecords = allRecordsBeforeOrientationFilter;
     }
 
@@ -190,8 +200,17 @@ async function getRandomFileList(context, url, dir) {
             name: item.id,
             FileType: item.metadata?.FileType,
             Width: item.metadata?.Width,
-            Height: item.metadata?.Height
+            Height: item.metadata?.Height,
+            // P1-19：过期过滤要用的到期时间也进缓存，读缓存时再过滤一次
+            ExpiresAt: item.metadata?.ExpiresAt
         }
+    });
+
+    // 建缓存前先滤掉已过期的记录
+    const now = Date.now();
+    allRecords = (allRecords || []).filter(item => {
+        const expiresAt = Number(item.ExpiresAt);
+        return !(Number.isFinite(expiresAt) && expiresAt <= now);
     });
 
     // 缓存结果，缓存时间为24小时

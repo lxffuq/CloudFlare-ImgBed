@@ -7,16 +7,33 @@ import { D1Database } from './d1Database.js';
 import { getExpiresAt, buildExpiryMarkerKey } from './fileExpiryHelpers.js';
 
 /**
+ * 解析当前使用的数据库后端：KV 与 D1 同时绑定时以 KV 为准。
+ * createDatabaseAdapter 与 checkDatabaseConfig 共用这一个判断，
+ * 避免“实际用 KV、对外报 D1”不一致。
+ * @param {Object} env - 环境变量
+ * @returns {'kv'|'d1'|null}
+ */
+export function getBackendType(env) {
+    if (env.img_url && typeof env.img_url.get === 'function') {
+        return 'kv';
+    }
+    if (env.img_d1 && typeof env.img_d1.prepare === 'function') {
+        return 'd1';
+    }
+    return null;
+}
+
+/**
  * 创建数据库适配器
  * @param {Object} env - 环境变量
  * @returns {Object} 数据库适配器实例
  */
 export function createDatabaseAdapter(env) {
     // 检查是否配置了数据库
-    if (env.img_url && typeof env.img_url.get === 'function') {
+    if (getBackendType(env) === 'kv') {
         // 使用KV存储
         return new KVAdapter(env.img_url);
-    } else if (env.img_d1 && typeof env.img_d1.prepare === 'function') {
+    } else if (getBackendType(env) === 'd1') {
         // 使用D1数据库
         return new D1Database(env.img_d1);
     } else {
@@ -166,14 +183,15 @@ export function getDatabase(env) {
  * @returns {Object} 配置信息
  */
 export function checkDatabaseConfig(env) {
-    var hasD1 = env.img_d1 && typeof env.img_d1.prepare === 'function';
-    var hasKV = env.img_url && typeof env.img_url.get === 'function';
+    var backend = getBackendType(env);
+    var hasD1 = !!(env.img_d1 && typeof env.img_d1.prepare === 'function');
+    var hasKV = !!(env.img_url && typeof env.img_url.get === 'function');
 
     return {
         hasD1: hasD1,
         hasKV: hasKV,
-        usingD1: hasD1,
-        usingKV: !hasD1 && hasKV,
-        configured: hasD1 || hasKV
+        usingD1: backend === 'd1',
+        usingKV: backend === 'kv',
+        configured: backend !== null
     };
 }

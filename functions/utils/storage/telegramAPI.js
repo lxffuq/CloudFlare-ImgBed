@@ -88,6 +88,22 @@ export class TelegramAPI {
                 return getFileDetails(responseData.result.document);
             }
 
+            if (responseData.result.animation) {
+                return getFileDetails(responseData.result.animation);
+            }
+
+            if (responseData.result.video_note) {
+                return getFileDetails(responseData.result.video_note);
+            }
+
+            if (responseData.result.voice) {
+                return getFileDetails(responseData.result.voice);
+            }
+
+            if (responseData.result.sticker) {
+                return getFileDetails(responseData.result.sticker);
+            }
+
             return null;
         } catch (error) {
             console.error('Error parsing Telegram response:', error.message);

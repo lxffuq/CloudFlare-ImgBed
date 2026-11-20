@@ -375,7 +375,7 @@ describe('upload', () => {
             ...mocks,
             buildUniqueFileId: async (ctx, name, type) => { namedType = type; return name; },
         });
-        const body = { fileSize: 24, fileName: 'photo.png', fileType: 'application/octet-stream; charset=binary', sha256: 'mock', fileSample: 'mock' };
+        const body = { fileSize: 24, fileName: 'photo.png', fileType: 'application/octet-stream; charset=binary', sha256: 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90', fileSample: 'mock' };
         const initialized = await getUrl.onRequestPost(context('https://test/upload/huggingface/getUploadUrl', JSON.stringify(body)));
         assert.equal(initialized.status, 200, await initialized.clone().text());
         assert.equal(namedType, 'image/png');

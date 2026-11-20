@@ -84,6 +84,17 @@ export async function onRequest(context) {
         // 路径安全处理
         const newFileId = sanitizeUploadFolder(body.newFileId.trim());
 
+        // 清洗后为空（如传入 ///）时拒绝：否则非 R2 渠道的记录会被移到空键上丢失。
+        if (!newFileId) {
+            return new Response(JSON.stringify({
+                success: false,
+                message: 'newFileId is empty after sanitization.',
+            }), {
+                status: 400,
+                headers: { 'Content-Type': 'application/json', ...corsHeaders },
+            });
+        }
+
         const url = new URL(request.url);
         const db = getDatabase(env);
 

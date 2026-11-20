@@ -14,6 +14,11 @@ import { cleanPersistedMetadata } from "../../../utils/metadata/metadataSecurity
 export async function onRequest(context) {
     const { request, env, params, waitUntil } = context;
 
+    // 前端是预编译 bundle，仍用 GET 调移动接口，因此不禁 GET，改为同站检查
+    // （见 delete/[[path]].js 的说明）：跨站信号拒绝，无信号放行。
+    const forbidden = rejectCrossSiteRequest(request);
+    if (forbidden) return forbidden;
+
     const url = new URL(request.url);
 
     // 读取目标文件夹，并进行路径安全处理
@@ -25,14 +30,24 @@ export async function onRequest(context) {
     if (folder === 'true') {
         try {
             params.path = decodeURIComponent(params.path);
-            // 使用队列存储需要处理的文件夹
+            const sourceFolder = params.path.split(',').join('/');
+            const sourceName = sourceFolder.split('/').pop();
+            // 移动后的文件夹根路径：dist 为空时留在原地同名，否则为 dist/原名。
+            const targetFolder = dist === '' ? sourceName : `${dist}/${sourceName}`;
+            // 移到自身或子目录下会无限嵌套：先挡住，什么都不写。
+            if (targetFolder === sourceFolder || targetFolder.startsWith(sourceFolder + '/')) {
+                return new Response(JSON.stringify({
+                    success: false,
+                    error: 'Cannot move a folder into itself or its subdirectory'
+                }), { status: 400 });
+            }
+
+            // 第一阶段：只收集，不写任何记录——先把整棵树要搬的文件一次枚举完。
             const folderQueue = [{
-                path: params.path.split(',').join('/'),
+                path: sourceFolder,
                 dist: dist
             }];
-
-            const processedFiles = [];
-            const failedFiles = [];
+            const plannedMoves = [];
 
             while (folderQueue.length > 0) {
                 const currentFolder = folderQueue.shift();
@@ -54,14 +69,7 @@ export async function onRequest(context) {
                     const fileId = file.name;
                     const fileName = file.name.split('/').pop();
                     const newFileId = `${folderDist}/${fileName}`;
-                    const cdnUrl = `https://${url.hostname}/file/${fileId}`;
-
-                    const success = await moveFile(env, fileId, newFileId, cdnUrl, url);
-                    if (success) {
-                        processedFiles.push({ fileId: fileId, newFileId: newFileId });
-                    } else {
-                        failedFiles.push(fileId);
-                    }
+                    plannedMoves.push({ fileId, newFileId });
                 }
 
                 // 将子文件夹添加到队列
@@ -71,6 +79,33 @@ export async function onRequest(context) {
                         path: dir,
                         dist: folderDist
                     });
+                }
+            }
+
+            // 第二阶段：全量预检——任一目标已存在就直接 400，之前不写任何记录。
+            const db = getDatabase(env);
+            for (const { fileId, newFileId } of plannedMoves) {
+                if (newFileId === fileId) continue; // 原地移动是幂等空操作，不算冲突
+                const existing = await db.getWithMetadata(newFileId);
+                if (existing && existing.value !== null && existing.value !== undefined) {
+                    return new Response(JSON.stringify({
+                        success: false,
+                        error: `Target already exists: ${newFileId}`
+                    }), { status: 409 });
+                }
+            }
+
+            // 第三阶段：执行搬移
+            const processedFiles = [];
+            const failedFiles = [];
+
+            for (const { fileId, newFileId } of plannedMoves) {
+                const cdnUrl = `https://${url.hostname}/file/${fileId}`;
+                const result = await moveFile(env, fileId, newFileId, cdnUrl, url);
+                if (result.ok) {
+                    processedFiles.push({ fileId: fileId, newFileId: newFileId });
+                } else {
+                    failedFiles.push(fileId);
                 }
             }
 
@@ -86,7 +121,7 @@ export async function onRequest(context) {
 
             // 返回处理结果
             return new Response(JSON.stringify({
-                success: true,
+                success: failedFiles.length === 0,
                 processed: processedFiles,
                 failed: failedFiles
             }));
@@ -108,12 +143,18 @@ export async function onRequest(context) {
         const newFileId = dist === '' ? fileKey : `${dist}/${fileKey}`;
         const cdnUrl = `https://${url.hostname}/file/${fileId}`;
 
-        const success = await moveFile(env, fileId, newFileId, cdnUrl, url);
-        if (!success) {
-            throw new Error('Move file failed');
+        const result = await moveFile(env, fileId, newFileId, cdnUrl, url);
+        if (!result.ok) {
+            if (result.status === 409) {
+                return new Response(JSON.stringify({
+                    success: false,
+                    error: result.message
+                }), { status: 409 });
+            }
+            throw new Error(result.message || 'Move file failed');
         } else {
-            // 从索引中删除旧文件，并添加新文件
-            waitUntil(moveFileInIndex(context, fileId, newFileId));
+            // 从索引中删除旧文件，并添加新文件（原地移动是空操作，不写索引）
+            if (!result.noop) waitUntil(moveFileInIndex(context, fileId, newFileId));
         }
 
         return new Response(JSON.stringify({
@@ -129,13 +170,48 @@ export async function onRequest(context) {
     }
 }
 
+// 同站检查：有跨站信号返回 403 响应，无跨站信号返回 null（见 delete/[[path]].js 的说明）。
+function isCrossSiteRequest(request) {
+    const fetchSite = request.headers.get('Sec-Fetch-Site');
+    if (fetchSite) return fetchSite !== 'same-origin' && fetchSite !== 'same-site' && fetchSite !== 'none';
+    const origin = request.headers.get('Origin');
+    if (origin) {
+        try { return new URL(origin).origin !== new URL(request.url).origin; } catch { return true; }
+    }
+    const referer = request.headers.get('Referer');
+    if (referer) {
+        try { return new URL(referer).origin !== new URL(request.url).origin; } catch { return true; }
+    }
+    return false;
+}
+
+function rejectCrossSiteRequest(request) {
+    if (request.headers.get('Authorization') || !isCrossSiteRequest(request)) return null;
+    return new Response(JSON.stringify({ success: false, error: 'Cross-site request forbidden' }), {
+        status: 403,
+        headers: { 'Content-Type': 'application/json' },
+    });
+}
+
 // 移动单个文件的核心函数
+// 返回 { ok: true, noop?: boolean } 或 { ok: false, status?: number, message?: string }。
 async function moveFile(env, fileId, newFileId, cdnUrl, url) {
     try {
+        // 移到自己所在位置是幂等空操作，直接返回成功，不碰存储。
+        if (newFileId === fileId) {
+            return { ok: true, noop: true };
+        }
+
         const db = getDatabase(env);
 
         // 读取图片信息
         const img = await db.getWithMetadata(fileId);
+
+        // 目标已存在时拒绝：R2/S3 路径先 put 再 delete，同名会先覆盖再删掉目标。
+        const existing = await db.getWithMetadata(newFileId);
+        if (existing && existing.value !== null && existing.value !== undefined) {
+            return { ok: false, status: 409, message: `Target already exists: ${newFileId}` };
+        }
 
         // 如果是R2渠道的图片，需要移动R2中对应的图片
         if (img.metadata?.Channel === 'CloudflareR2') {
@@ -195,10 +271,10 @@ async function moveFile(env, fileId, newFileId, cdnUrl, url) {
         await purgeRandomFileListCache(url.origin, normalizedFolder, normalizedDist);
         await purgePublicFileListCache(url.origin, normalizedFolder, normalizedDist);
 
-        return true;
+        return { ok: true };
     } catch (e) {
         console.error('Move file failed:', e);
-        return false;
+        return { ok: false, message: e.message };
     }
 }
 

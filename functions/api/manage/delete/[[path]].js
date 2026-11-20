@@ -4,6 +4,7 @@ import { purgeCFCache, purgeRandomFileListCache, purgePublicFileListCache } from
 import { removeFileFromIndex, batchRemoveFilesFromIndex } from "../../../utils/indexManager.js";
 import { getDatabase } from '../../../utils/databaseAdapter.js';
 import { buildExpiryMarkerKey, getExpiresAt, isMissingRecord } from '../../../utils/fileExpiryHelpers.js';
+import { validateFileId } from '../../../utils/tagService.js';
 import { DiscordAPI } from '../../../utils/storage/discordAPI.js';
 import { HuggingFaceAPI } from '../../../utils/storage/huggingfaceAPI.js';
 import { WebDAVAPI } from '../../../utils/storage/webdavAPI.js';
@@ -22,8 +23,43 @@ const corsHeaders = {
     'Access-Control-Max-Age': '86400',
 };
 
+// 同站检查：有跨站信号返回 403 响应，无跨站信号返回 null。
+// validateFileId 在单测加载器里可能被 stub 掉（旧测试未提供该 mock），生产环境恒为函数。
+function isCrossSiteRequest(request) {
+    const fetchSite = request.headers.get('Sec-Fetch-Site');
+    if (fetchSite) return fetchSite !== 'same-origin' && fetchSite !== 'same-site' && fetchSite !== 'none';
+    const origin = request.headers.get('Origin');
+    if (origin) {
+        try { return new URL(origin).origin !== new URL(request.url).origin; } catch { return true; }
+    }
+    const referer = request.headers.get('Referer');
+    if (referer) {
+        try { return new URL(referer).origin !== new URL(request.url).origin; } catch { return true; }
+    }
+    return false;
+}
+
+function rejectCrossSiteRequest(request) {
+    if (request.headers.get('Authorization') || !isCrossSiteRequest(request)) return null;
+    return new Response(JSON.stringify({ success: false, error: 'Cross-site request forbidden' }), {
+        status: 403,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+    });
+}
+
+function assertDeletableFileId(fileId) {
+    if (typeof validateFileId === 'function') validateFileId(fileId);
+}
+
 export async function onRequest(context) {
     const { request, env, params, waitUntil } = context;
+
+    // 管理端用 Cookie 会话鉴权：跨站页面无需知道 Token 就能借 Cookie 触发 GET 删除（CSRF）。
+    // 前端是预编译 bundle，仍用 GET 调删除接口，因此不禁 GET，改为同站检查：
+    // Sec-Fetch-Site / Origin / Referer 任一出现跨站信号即拒绝；无任何来源信号的请求
+    // （服务端内调、curl）放行；带 Authorization 的请求走 Token 鉴权，跨站页面无法获知 Token，不构成 CSRF。
+    const forbidden = rejectCrossSiteRequest(request);
+    if (forbidden) return forbidden;
 
     const url = new URL(request.url);
 
@@ -60,6 +96,14 @@ export async function onRequest(context) {
                     const fileId = file.name;
                     const cdnUrl = `https://${url.hostname}/file/${fileId}`;
 
+                    // 系统配置键（manage@ 开头等）禁止删除，validateFileId 会抛错。
+                    try {
+                        assertDeletableFileId(fileId);
+                    } catch (e) {
+                        details.push({ fileId, success: false, existed: false, error: e.message });
+                        failedFiles.push(fileId);
+                        continue;
+                    }
                     const result = await deleteFile(env, fileId, cdnUrl, url);
                     const success = !!(result && result.deleted);
                     details.push({ fileId, success, existed: !!result?.existed, error: success ? '' : 'Delete file failed' });
@@ -87,7 +131,7 @@ export async function onRequest(context) {
             }
 
             return new Response(JSON.stringify({
-                success: true,
+                success: failedFiles.length === 0,
                 deleted: deletedFiles,
                 failed: failedFiles,
                 missing: missingFiles,
@@ -113,6 +157,9 @@ export async function onRequest(context) {
         params.path = decodeURIComponent(params.path);
         const fileId = params.path.split(',').join('/');
         const cdnUrl = `https://${url.hostname}/file/${fileId}`;
+
+        // 系统配置键（manage@ 开头等）禁止删除：禁 manage@ 前缀、空段、..。
+        assertDeletableFileId(fileId);
 
         const result = await deleteFile(env, fileId, cdnUrl, url);
         if (!result || !result.deleted) {
@@ -177,6 +224,9 @@ export async function deleteStoredFile(env, fileId, img) {
 // 删除单个文件的核心函数
 export async function deleteFile(env, fileId, cdnUrl, url) {
     try {
+        // 纵深防御：系统配置键（manage@ 开头等）禁止删除，批量删除与其它调用方同样受此保护。
+        assertDeletableFileId(fileId);
+
         // 读取图片信息
         const db = getDatabase(env);
         const img = await db.getWithMetadata(fileId);

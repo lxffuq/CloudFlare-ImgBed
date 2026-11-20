@@ -5,6 +5,11 @@
 import { dualAuthCheck } from '../utils/auth/dualAuth.js';
 
 const IS_NODE_RUNTIME = typeof process !== 'undefined' && Boolean(process.versions?.node);
+
+// 上游拉取超时与响应体上限：防止慢速/超大上游拖垮 Worker 配额
+export const FETCH_TIMEOUT_MS = 30000;
+export const FETCH_MAX_BODY_BYTES = 10 * 1024 * 1024;
+
 const HOP_BY_HOP_HEADERS = [
     'connection',
     'keep-alive',
@@ -31,6 +36,9 @@ function createProxyHeaders(responseHeaders) {
         headers.delete(name);
     }
 
+    // 剥离上游 Set-Cookie：不让上游在图床域名下种 Cookie
+    headers.delete('set-cookie');
+
     if (IS_NODE_RUNTIME) {
         headers.delete('content-encoding');
         headers.delete('content-length');
@@ -39,12 +47,45 @@ function createProxyHeaders(responseHeaders) {
     return headers;
 }
 
-function fetchTarget(url) {
-    const options = { redirect: 'manual' };
+function fetchTarget(url, signal) {
+    const options = { redirect: 'manual', signal };
     if (IS_NODE_RUNTIME) {
         options.headers = { 'Accept-Encoding': 'identity' };
     }
     return fetch(url.toString(), options);
+}
+
+/**
+ * 在大小上限内读完响应体，超限返回 null（调用方据此返回 413）
+ * @param {ReadableStream|null} body - 上游响应体
+ * @returns {Promise<Uint8Array|null>}
+ */
+async function readBodyWithLimit(body) {
+    if (!body) return new Uint8Array(0);
+    const reader = body.getReader();
+    const chunks = [];
+    let total = 0;
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            total += value.byteLength;
+            if (total > FETCH_MAX_BODY_BYTES) {
+                try { await reader.cancel(); } catch { /* ignore */ }
+                return null;
+            }
+            chunks.push(value);
+        }
+    } finally {
+        try { reader.releaseLock(); } catch { /* ignore */ }
+    }
+    const result = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+        result.set(chunk, offset);
+        offset += chunk.byteLength;
+    }
+    return result;
 }
 
 /**
@@ -58,6 +99,9 @@ function fetchTarget(url) {
 function isPrivateHostname(hostname) {
     if (!hostname) return true;
     let h = hostname.toLowerCase();
+    // 去掉末尾的点：localhost. / 127.0.0.1. 这类写法与不带点的等价，不能绕过检查
+    h = h.replace(/\.+$/, '');
+    if (!h) return true;
     // Strip IPv6 brackets
     if (h.startsWith('[') && h.endsWith(']')) {
         h = h.slice(1, -1);
@@ -110,10 +154,17 @@ export async function onRequest(context) {
         data
     } = context;
 
-    // 双重鉴权检查
+    // 双重鉴权检查：Token 调用本端点至少需要 manage 权限，
+    // 任意有效 Token 不再等同管理员；管理员会话 / 用户凭据不受该权限约束。
     const url = new URL(request.url);
-    const { authorized } = await dualAuthCheck(env, url, request);
-    if (!authorized) {
+    const authResult = await dualAuthCheck(env, url, request, { requiredPermission: 'manage' });
+    if (authResult.configError) {
+        return new Response(JSON.stringify({ error: 'Security config unavailable' }), {
+            status: 503,
+            headers: { 'Content-Type': 'application/json' }
+        });
+    }
+    if (!authResult.authorized) {
         return new Response(JSON.stringify({ error: 'Unauthorized' }), {
             status: 401,
             headers: { 'Content-Type': 'application/json' }
@@ -163,26 +214,78 @@ export async function onRequest(context) {
 
     // Follow redirects manually so a permitted host cannot redirect us onto
     // an internal address without re-validation.
-    let currentUrl = parsed;
-    let response = await fetchTarget(currentUrl);
-    let hops = 0;
-    while (response.status >= 300 && response.status < 400 && response.headers.get('location') && hops < 5) {
-        const next = new URL(response.headers.get('location'), currentUrl);
-        if ((next.protocol !== 'http:' && next.protocol !== 'https:') ||
-            next.username || next.password ||
-            isPrivateHostname(next.hostname)) {
-            return new Response(JSON.stringify({ error: 'Redirect to disallowed target' }), {
-                status: 400,
+    // 整个拉取过程（含重定向）共用一个超时，超时后 fetch 抛 AbortError。
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    let response;
+    try {
+        let currentUrl = parsed;
+        response = await fetchTarget(currentUrl, controller.signal);
+        let hops = 0;
+        while (response.status >= 300 && response.status < 400 && response.headers.get('location') && hops < 5) {
+            const next = new URL(response.headers.get('location'), currentUrl);
+            if ((next.protocol !== 'http:' && next.protocol !== 'https:') ||
+                next.username || next.password ||
+                isPrivateHostname(next.hostname)) {
+                return new Response(JSON.stringify({ error: 'Redirect to disallowed target' }), {
+                    status: 400,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+            }
+            currentUrl = next;
+            response = await fetchTarget(currentUrl, controller.signal);
+            hops++;
+        }
+    } catch (error) {
+        if (error && error.name === 'AbortError') {
+            return new Response(JSON.stringify({ error: 'Upstream request timed out' }), {
+                status: 504,
                 headers: { 'Content-Type': 'application/json' }
             });
         }
-        currentUrl = next;
-        response = await fetchTarget(currentUrl);
-        hops++;
+        return new Response(JSON.stringify({ error: 'Failed to fetch upstream URL' }), {
+            status: 502,
+            headers: { 'Content-Type': 'application/json' }
+        });
+    } finally {
+        clearTimeout(timeoutId);
+    }
+
+    // 响应体大小上限：先看 Content-Length 快速拒绝，再流式读取中途截断。
+    // 只限制大小，不限制 Content-Type（图片等正常返回不受影响）。
+    const declaredLength = Number(response.headers.get('content-length'));
+    if (Number.isFinite(declaredLength) && declaredLength > FETCH_MAX_BODY_BYTES) {
+        return new Response(JSON.stringify({ error: 'Upstream response too large' }), {
+            status: 413,
+            headers: { 'Content-Type': 'application/json' }
+        });
+    }
+
+    let body;
+    try {
+        body = await readBodyWithLimit(response.body);
+    } catch (error) {
+        if (error && error.name === 'AbortError') {
+            return new Response(JSON.stringify({ error: 'Upstream request timed out' }), {
+                status: 504,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+        return new Response(JSON.stringify({ error: 'Failed to read upstream response' }), {
+            status: 502,
+            headers: { 'Content-Type': 'application/json' }
+        });
+    }
+    if (body === null) {
+        return new Response(JSON.stringify({ error: 'Upstream response too large' }), {
+            status: 413,
+            headers: { 'Content-Type': 'application/json' }
+        });
     }
 
     const headers = createProxyHeaders(response.headers);
-    return new Response(response.body, {
+    // 空体时传 null：204/304 等状态不允许带 body，否则 Response 构造会抛错
+    return new Response(body.byteLength === 0 ? null : body, {
         headers: headers,
         status: response.status
     })

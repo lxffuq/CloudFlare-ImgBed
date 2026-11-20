@@ -926,7 +926,8 @@ describe('file expiry', () => {
             const filePurges = () => fixture.purges.filter(([kind]) => kind === 'file').length;
 
             await patch({ ExpiresAt: Date.now() + DAY });
-            assert.deepEqual(fixture.purges, [['file', 'https://test/file/photo.png']]);
+            // P2-54：元数据变更后还会清随机图/公开列表缓存（根目录 ''），CDN（file）仍只在到期提前时清。
+            assert.deepEqual(fixture.purges, [['file', 'https://test/file/photo.png'], ['public', 'https://test', ''], ['random', 'https://test', '']]);
             await patch({ ExpiresAt: Date.now() + 2 * DAY });
             await patch({ FileName: 'renamed.png' });
             assert.equal(filePurges(), 1);

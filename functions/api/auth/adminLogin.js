@@ -26,6 +26,14 @@ export async function onRequestPost(context) {
     const passwordConfigured = !!(adminPassword && adminPassword.trim());
     const adminConfigured = usernameConfigured || passwordConfigured;
 
+    // 只配了用户名、没配密码时，拒绝登录：用户名不是秘密，不能仅凭用户名发管理员会话
+    if (usernameConfigured && !passwordConfigured) {
+        return new Response(JSON.stringify({ error: 'Admin password is not configured. Please set an admin password first.' }), {
+            status: 401,
+            headers: { 'Content-Type': 'application/json' },
+        });
+    }
+
     // 管理员未配置，无需认证，直接创建会话
     if (!adminConfigured) {
         const { cookie } = await createSession(env, 'admin');
