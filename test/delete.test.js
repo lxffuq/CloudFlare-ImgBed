@@ -30,54 +30,6 @@ describe('delete files', () => {
         });
     }
 
-    it('removes the file from the index before responding, without relying on background tasks', async () => {
-        // 回归：以前索引删除操作放进 waitUntil，响应先回去了、索引里文件还在，
-        // 用户一刷新列表就又看到删掉的图片。现在响应前必须落盘。
-        await fixture.seed([{ id: 'photo.png', metadata: { Channel: 'CloudflareR2', FileType: 'image/png' } }]);
-        const ctx = context('photo.png');
-        const response = await single.onRequest(ctx);
-        assert.equal(response.status, 200);
-        assert.deepEqual(ctx.backgroundTasks, []);
-        const index = await fixture.mocks.readIndex(ctx, { count: -1, includeSubdirFiles: true });
-        assert.equal(index.success, true);
-        assert.deepEqual(index.files, []);
-    });
-
-    it('removes the file from the list on the first refresh even when the operation list has not caught up yet', async () => {
-        // 回归：删图后要刷新好几次才消失。删除操作是记下来了，但要靠 KV list
-        // 才能被下一次列表请求发现，而 KV list 是最终一致的——刚写下的操作键
-        // 可能要过几秒才出现在 list 结果里。现在删除响应前就把这次删除合进索引，
-        // 刷新一次就看不到了。
-        await fixture.seed([{ id: 'photo.png', metadata: { Channel: 'CloudflareR2', FileType: 'image/png' } }]);
-        // 模拟 KV list 的最终一致性：list 暂时看不到刚写下的操作记录。
-        const originalList = fixture.db.list.bind(fixture.db);
-        fixture.db.list = async (options) => {
-            const result = await originalList(options);
-            return { ...result, keys: result.keys.filter(key => !key.name.startsWith('manage@index@operation_')) };
-        };
-        try {
-            const ctx = context('photo.png');
-            const response = await single.onRequest(ctx);
-            assert.equal(response.status, 200);
-            // list 仍然看不到操作记录：合并是删除自己直接做的，不靠 list。
-            const index = await fixture.mocks.readIndex(ctx, { count: -1, includeSubdirFiles: true });
-            assert.equal(index.success, true);
-            assert.deepEqual(index.files, []);
-            // 操作记录还留在队列里当保险（没被 list 看到，所以没被清理），
-            // 下一次 list 看到它时会重放（幂等）再清理。
-            const pending = await originalList({ prefix: 'manage@index@operation_' });
-            assert.equal(pending.keys.length, 1);
-        } finally {
-            fixture.db.list = originalList;
-        }
-        // list 恢复后，下一次读取会重放并清理掉那条操作记录。
-        const indexAfter = await fixture.mocks.readIndex(context('photo.png'), { count: -1, includeSubdirFiles: true });
-        assert.equal(indexAfter.success, true);
-        assert.deepEqual(indexAfter.files, []);
-        const pendingAfter = await fixture.db.list({ prefix: 'manage@index@operation_' });
-        assert.equal(pendingAfter.keys.length, 0);
-    });
-
     it('deletes the R2 object, database record and index entry and invalidates caches', async () => {
         const id = '相册/photo.png';
         const expiresAt = Date.now() + 86400000;

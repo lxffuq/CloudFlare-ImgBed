@@ -45,10 +45,7 @@ let lastOpportunisticRun = 0;
  */
 export async function resolveUploadExpiry(context) {
     const { env, request, url } = context;
-    // 上传入口在请求开头已经读过上传配置，直接复用，不再为有效期单独重读一次。
-    // 直传提交等入口没带配置时才现读。
-    const uploadConfig = context.uploadConfig || await fetchUploadConfig(env);
-    const { fileExpiry } = uploadConfig;
+    const { fileExpiry } = await fetchUploadConfig(env);
     if (!fileExpiry?.enabled) {
         return { expiresAt: null };
     }

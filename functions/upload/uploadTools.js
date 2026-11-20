@@ -284,10 +284,8 @@ export function getImageDimensions(buffer, fileType) {
 }
 
 // 图像审查
-// securityConfig 可由调用方传入（上传入口在请求开头已经读过一次）；不传时才现读，
-// 避免每次上传都为了一次配置多走一次 KV。
-export async function moderateContent(env, url, securityConfig = null) {
-    securityConfig = securityConfig || await fetchSecurityConfig(env);
+export async function moderateContent(env, url) {
+    const securityConfig = await fetchSecurityConfig(env);
     const uploadModerate = securityConfig.upload.moderate;
 
     const enableModerate = uploadModerate && uploadModerate.enabled;
